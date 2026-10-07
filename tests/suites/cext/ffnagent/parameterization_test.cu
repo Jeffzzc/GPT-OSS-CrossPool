@@ -32,15 +32,16 @@ XPOOL_KERNEL_FN void read_resources(int *output, const int *w13, const int *w2, 
 XPOOL_KERNEL_FN void rebind_resources(const xpool::ffnagent::BindingSite *sites,
                                       const xpool::ffnagent::LayerBindingValues *values,
                                       cudaError_t *status) {
-  cudaGraphKernelNodeUpdate updates[resource_count];
+  *status = cudaSuccess;
   for (auto i = std::size_t{0}; i < resource_count; ++i) {
-    updates[i].node = sites[i].node;
-    updates[i].field = cudaGraphKernelNodeFieldParam;
-    updates[i].updateData.param.pValue = reinterpret_cast<const unsigned char *>(values) + sites[i].value_offset_bytes;
-    updates[i].updateData.param.offset = sites[i].parameter_offset_bytes;
-    updates[i].updateData.param.size = sizeof(std::uintptr_t);
+    const auto result = cudaGraphKernelNodeSetParam(
+        sites[i].node, sites[i].parameter_offset_bytes,
+        reinterpret_cast<const unsigned char *>(values) + sites[i].value_offset_bytes, sizeof(std::uintptr_t));
+    if (result != cudaSuccess) {
+      *status = result;
+      return;
+    }
   }
-  *status = cudaGraphKernelNodeUpdatesApply(updates, resource_count);
 }
 
 TEST(Mxfp4ParameterizationTest, RebindsEveryBiasAndScaleAcrossLayers) {
@@ -75,8 +76,9 @@ TEST(Mxfp4ParameterizationTest, RebindsEveryBiasAndScaleAcrossLayers) {
     for (auto i = std::size_t{0}; i < resource_count; ++i) {
       args[i + 1] = &pointers[i];
     }
-    xpool::utils::graph::add_kernel_node(graph, reinterpret_cast<const void *>(read_resources),
-                                         dim3{1}, dim3{1}, 0, args.data());
+    const auto node = xpool::utils::graph::add_kernel_node(
+        graph, reinterpret_cast<const void *>(read_resources), dim3{1}, dim3{1}, 0, args.data());
+    ASSERT_EQ(xpool::utils::graph::node_type(node), cudaGraphNodeTypeKernel);
   }
   auto parent = cudaGraph_t{};
   ASSERT_EQ(cudaGraphCreate(&parent, 0), cudaSuccess);

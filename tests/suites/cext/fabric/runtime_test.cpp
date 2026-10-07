@@ -60,16 +60,19 @@ moe_execution_projection(bool router_owner, std::optional<std::uintptr_t> captur
   const auto primary_router = router_owner ? std::optional{xpool::ffnagent::MoeRouterBindingResourceProjection{
                                                  .weight_address = 10,
                                                  .correction_bias_address = std::nullopt,
+                                                 .projection_bias_address = std::nullopt,
                                              }}
                                            : std::nullopt;
   const auto control_router = router_owner ? std::optional{xpool::ffnagent::MoeRouterBindingResourceProjection{
                                                  .weight_address = 13,
                                                  .correction_bias_address = std::nullopt,
+                                                 .projection_bias_address = std::nullopt,
                                              }}
                                            : std::nullopt;
   const auto target_router = router_owner ? std::optional{xpool::ffnagent::MoeRouterBindingResourceProjection{
                                                 .weight_address = 16,
                                                 .correction_bias_address = std::nullopt,
+                                                .projection_bias_address = std::nullopt,
                                             }}
                                           : std::nullopt;
   auto signature = xpool::ffnagent::MoeExecutionSignatureProjection{
@@ -93,12 +96,14 @@ moe_execution_projection(bool router_owner, std::optional<std::uintptr_t> captur
               .expert_gate_up_weight_address = 8,
               .expert_down_weight_address = 9,
               .router = primary_router,
+              .mxfp4 = std::nullopt,
           },
       .control_capture_resources =
           {
               .expert_gate_up_weight_address = 11,
               .expert_down_weight_address = 12,
               .router = control_router,
+              .mxfp4 = std::nullopt,
           },
   };
   return {
@@ -114,6 +119,7 @@ moe_execution_projection(bool router_owner, std::optional<std::uintptr_t> captur
                           .expert_gate_up_weight_address = 14,
                           .expert_down_weight_address = 15,
                           .router = target_router,
+                          .mxfp4 = std::nullopt,
                       },
               },
           },
