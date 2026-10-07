@@ -100,6 +100,44 @@ def test_glm_router_memory_keeps_fp32_weights_and_input_workspace() -> None:
         assert signature.router.router_workspace_bytes == 4 * signature.payload_row_capacity * (spec.hidden_size + 64)
 
 
+def test_mxfp4_memory_counts_packed_resources_and_block_aligned_tp() -> None:
+    spec = corpus.calibration_corpus_spec("clamped-mxfp4-moe32")
+    profile = corpus.build_instance_profile(spec, group_sum_complete=False)
+    install_test_config(
+        XpoolConfig.from_mapping(
+            {
+                "scheduler": {"slo": {"ttft_ms": 1000, "tbt_ms": 50}},
+                "atn": {"devices": [0]},
+                "ffn": {"devices": [1, 2, 3, 4]},
+                "models": [{"id": spec.model_id, "path": "/models/mxfp4", "ffn_tp_size": 4}],
+            }
+        )
+    )
+    estimator = device_memory.DeviceMemoryEstimator(model_specs=(spec,), instance_profiles=(profile,))
+    width, hidden, experts = 736, 2880, 32
+    expected = (
+        experts * width * hidden,
+        experts * hidden * width // 2,
+        experts * 2 * width * hidden // 32,
+        experts * hidden * width // 32,
+        experts * 2 * width * 2,
+        experts * hidden * 2,
+    )
+    assert estimator.packed_weight_storage_bytes(0, 0, 0) == (*expected, experts * hidden * 2, experts * 2)
+    assert estimator.packed_weight_storage_bytes(0, 0, 3) == expected
+    for rank in (0, 3):
+        signatures = execution.required_execution_signatures(
+            model_spec=spec, profile=profile, layer_ordinal=0, tp_rank=rank, tp_size=4
+        )
+        for signature in signatures:
+            assert isinstance(signature, execution.MoeFfnExecutionSignature)
+            assert signature.local_intermediate_size == width
+            assert execution.control_capture_probe_storage_bytes(signature) == estimator.packed_weight_storage_bytes(
+                0, 0, rank
+            )
+    assert corpus.build_model_plan(spec, tp_size=4).layers[0].local_intermediate_size == width
+
+
 def test_exact_dense_allocation_ledger_and_feature_rows() -> None:
     estimator, plan = estimator_and_plan()
 

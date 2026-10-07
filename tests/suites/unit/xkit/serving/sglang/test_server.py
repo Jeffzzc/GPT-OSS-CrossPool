@@ -15,10 +15,7 @@ from xkit.serving.readiness import ReadinessEvidence
 from xkit.serving.sglang.endpoints import SglangEndpointFamily, SglangEndpointFamilyLease
 from xkit.serving.sglang.graph import SglangGraphMode
 from xkit.serving.sglang.launch import SglangLaunchModel
-from xkit.serving.sglang.server import (
-    SglangServerProcess,
-    server_command,
-)
+from xkit.serving.sglang.server import SglangServerProcess, server_command
 from xpool.config import XpoolConfig
 from xtest.harness.support.config import TEST_MODEL_ID
 
@@ -43,6 +40,14 @@ from xtest.harness.support.config import TEST_MODEL_ID
             True,
             "full",
             "breakable",
+        ),
+        (
+            SglangLaunchModel(
+                TEST_MODEL_ID, SglangGraphMode.DECODE_FULL, disable_hybrid_swa_memory=True, dtype="bfloat16"
+            ),
+            False,
+            "full",
+            "disabled",
         ),
     ],
 )
@@ -71,6 +76,10 @@ def test_server_command_projects_pinned_cli_policy(
     assert command[command.index("--cuda-graph-backend-decode") + 1] == decode_backend
     assert command[command.index("--cuda-graph-backend-prefill") + 1] == prefill_backend
     assert ("--enable-dp-attention" in command) is enable_dp_attention
+    assert ("--disable-hybrid-swa-memory" in command) is model.disable_hybrid_swa_memory
+    assert ("--dtype" in command) is (model.dtype != "auto")
+    if model.dtype != "auto":
+        assert command[command.index("--dtype") + 1] == model.dtype
 
 
 def test_server_start_prepares_process_environment_and_log_directory(

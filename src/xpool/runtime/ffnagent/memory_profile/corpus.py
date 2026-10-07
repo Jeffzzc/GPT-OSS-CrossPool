@@ -27,7 +27,7 @@ from xpool.runtime.ffnagent import architecture, weights
 
 DECODE_PAYLOAD_ROW_CAPACITY = 2048
 PREFILL_PAYLOAD_ROW_CAPACITY = 4096
-FIT_COORDINATES = ("C0a", "C1", "C2", "C3", "D-T")
+FIT_COORDINATES = ("C0a", "C1", "C2", "C3", "C4", "D-T")
 HELD_OUT_COORDINATE = "H0"
 
 
@@ -146,6 +146,36 @@ def calibration_corpus_spec(member: str) -> ffn.FfnModelSpec:
                 routed_scaling_factor=1.0,
             ),
         )
+    elif member == "clamped-mxfp4-moe32":
+        hidden_size = 2880
+        prefix = f"calibration.{member}.layers.0.mlp"
+        layers = (
+            ffn.MoeFfnSpec(
+                kind=LayerKind.MOE,
+                layer_id=0,
+                expert_intermediate_size=2880,
+                shared_expert_count=0,
+                routed_topk=4,
+                renormalize=True,
+                routed_scaling_factor=1.0,
+                expert_weight_kind=ffn.ExpertWeightKind.MXFP4,
+                checkpoint=ffn.MoeFfnCheckpointKeys(
+                    router_weight_key=f"{prefix}.router.weight",
+                    router_projection_bias_key=f"{prefix}.router.bias",
+                    router_correction_bias_key=None,
+                    shared_expert=None,
+                    mxfp4_experts=ffn.Mxfp4ExpertCheckpointKeys(
+                        expert_count=32,
+                        gate_up_blocks_key=f"{prefix}.experts.gate_up_blocks",
+                        down_blocks_key=f"{prefix}.experts.down_blocks",
+                        gate_up_scales_key=f"{prefix}.experts.gate_up_scales",
+                        down_scales_key=f"{prefix}.experts.down_scales",
+                        gate_up_bias_key=f"{prefix}.experts.gate_up_bias",
+                        down_bias_key=f"{prefix}.experts.down_bias",
+                    ),
+                ),
+            ),
+        )
     else:
         raise ValueError(f"unsupported FFN Calibration Corpus member {member!r}")
     architecture_names = {
@@ -153,12 +183,15 @@ def calibration_corpus_spec(member: str) -> ffn.FfnModelSpec:
         "softmax-shared-moe64": "DeepseekV2ForCausalLM",
         "corrected-shared-moe64": "Glm4MoeLiteForCausalLM",
         "softmax-moe128": "Qwen3MoeForCausalLM",
+        "clamped-mxfp4-moe32": "GptOssForCausalLM",
     }
     return ffn.FfnModelSpec(
         model_id=ModelId(f"calibration/{member}"),
         architecture_name=architecture_names[member],
         hidden_size=hidden_size,
-        activation=ffn.ActivationKind.SILU,
+        activation=(ffn.ActivationKind.CLAMPED_SWIGLU if member == "clamped-mxfp4-moe32" else ffn.ActivationKind.SILU),
+        activation_alpha=1.702 if member == "clamped-mxfp4-moe32" else None,
+        activation_clamp_limit=7.0 if member == "clamped-mxfp4-moe32" else None,
         layers=layers,
     )
 
@@ -179,12 +212,15 @@ def coordinate_members(
         return (("corrected-shared-moe64", min(ffnagent_count, 2), 1, True),)
     if coordinate == "C3":
         return (("softmax-moe128", min(ffnagent_count, 2), 1, True),)
+    if coordinate == "C4":
+        return (("clamped-mxfp4-moe32", min(ffnagent_count, 2), 1, True),)
     if coordinate == "D-T" and ffnagent_count >= 2:
         return (("gated-dense", 2, 1, True),)
     if coordinate == HELD_OUT_COORDINATE:
         return (
             ("softmax-moe128", min(ffnagent_count, 4), min(atnagent_count, 2), True),
             ("gated-dense", min(ffnagent_count, 2), min(atnagent_count, 2), False),
+            ("clamped-mxfp4-moe32", min(ffnagent_count, 4), 1, True),
         )
     raise ValueError(f"coordinate {coordinate!r} is unreachable for F={ffnagent_count}")
 
@@ -218,12 +254,10 @@ def build_model_plan(spec: ffn.FfnModelSpec, *, tp_size: int) -> FfnModelPlan:
                 )
             )
             continue
-        if layer.expert_intermediate_size % tp_size:
-            raise ValueError(f"MoE layer {layer.layer_id} is not divisible by TP={tp_size}")
         layers.append(
             MoeFfnLayerPlan(
                 ffnagent_indices=group,
-                local_intermediate_size=layer.expert_intermediate_size // tp_size,
+                local_intermediate_size=ffn.local_intermediate_size(layer, tp_size),
                 effective_topk=layer.routed_topk + layer.shared_expert_count,
             )
         )
@@ -325,7 +359,35 @@ def materialize_calibration_weights(
                         if layer_spec.checkpoint.router_correction_bias_key is not None
                         else None
                     ),
+                    projection_bias=(
+                        torch.zeros(layer_spec.routed_expert_count, dtype=torch.bfloat16, device="cuda")
+                        if layer_spec.checkpoint.router_projection_bias_key is not None
+                        else None
+                    ),
                 )
+            if layer_spec.expert_weight_kind is ffn.ExpertWeightKind.MXFP4:
+                local_width = layer_plan.local_intermediate_size
+                hidden_size = model_spec.hidden_size
+                model_weights.append(
+                    weights.Mxfp4MoeFfnWeights(
+                        gate_up_blocks=torch.zeros(
+                            (expert_count, 2 * local_width, hidden_size // 2), dtype=torch.uint8, device="cuda"
+                        ),
+                        down_blocks=torch.zeros(
+                            (expert_count, hidden_size, local_width // 2), dtype=torch.uint8, device="cuda"
+                        ),
+                        gate_up_scales=torch.full(
+                            (expert_count, 2 * local_width, hidden_size // 32), 127, dtype=torch.uint8, device="cuda"
+                        ),
+                        down_scales=torch.full(
+                            (expert_count, hidden_size, local_width // 32), 127, dtype=torch.uint8, device="cuda"
+                        ),
+                        gate_up_bias=torch.zeros((expert_count, 2 * local_width), dtype=torch.bfloat16, device="cuda"),
+                        down_bias=torch.zeros((expert_count, hidden_size), dtype=torch.bfloat16, device="cuda"),
+                        router=router,
+                    )
+                )
+                continue
             model_weights.append(
                 weights.MoeFfnWeights(
                     expert_gate_up_weight=torch.empty(

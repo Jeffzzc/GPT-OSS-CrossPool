@@ -8,18 +8,10 @@ from ortools.graph.python import max_flow
 from ortools.sat.python import cp_model
 
 from xpool import ffn
-from xpool.fabric import (
-    DenseFfnLayerPlan,
-    FabricInstancePlan,
-    FfnModelPlan,
-    MoeFfnLayerPlan,
-)
+from xpool.fabric import DenseFfnLayerPlan, FabricInstancePlan, FfnModelPlan, MoeFfnLayerPlan
 from xpool.memory import MIB, ensure_nonnegative_int64
 from xpool.runtime.ffnagent import execution
-from xpool.runtime.ffnagent.device_memory import (
-    DeviceMemoryEstimator,
-    allocator_block_allowance_bytes,
-)
+from xpool.runtime.ffnagent.device_memory import DeviceMemoryEstimator, allocator_block_allowance_bytes
 from xpool.service.errors import XpoolDaemonError
 from xpool.utils import align_up
 
@@ -928,10 +920,12 @@ def place_layer(
             local_intermediate_size=layer.intermediate_size // tp_size,
         )
 
-    if layer.expert_intermediate_size % tp_size:
-        raise XpoolDaemonError("conflict", f"MoE layer {layer.layer_id} intermediate size is not divisible by FFN TP")
+    try:
+        local_width = ffn.local_intermediate_size(layer, tp_size)
+    except ValueError as error:
+        raise XpoolDaemonError("conflict", str(error)) from error
     return MoeFfnLayerPlan(
         ffnagent_indices=execution_group,
-        local_intermediate_size=layer.expert_intermediate_size // tp_size,
+        local_intermediate_size=local_width,
         effective_topk=layer.routed_topk + layer.shared_expert_count,
     )

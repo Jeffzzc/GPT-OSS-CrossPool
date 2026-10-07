@@ -47,6 +47,8 @@ class E2eServingCase(BaseModel):
     estimated_duration_seconds: float = Field(gt=0)
     timeout_seconds: float = Field(gt=0)
     elastic_kv: E2eElasticKvWorkload | None = None
+    disable_hybrid_swa_memory: bool = False
+    dtype: Literal["auto", "bfloat16"] = "auto"
 
     @model_validator(mode="after")
     def validate_case(self) -> Self:
@@ -111,6 +113,8 @@ class E2eFfnNumericalCase(BaseModel):
     model_id: ModelId
     layer_ids: tuple[int, ...]
     input_matrix: E2eFfnInputMatrix
+    reference_moe_runner_backend: Literal["auto", "triton_kernels"] = "auto"
+    reference_dtype: Literal["auto", "bfloat16"] = "auto"
     estimated_duration_seconds: float = Field(gt=0)
     timeout_seconds: float = Field(gt=0)
 

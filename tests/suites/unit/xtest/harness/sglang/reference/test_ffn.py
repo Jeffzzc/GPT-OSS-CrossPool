@@ -201,18 +201,30 @@ def test_runner_projects_moe_routing_evidence(
             "hidden_states": hidden_states,
             "topk_ids": torch.tensor([[3, 1], [2, 0], [1, 3]], dtype=torch.int32),
             "topk_weights": torch.full((3, 2), 0.5, dtype=torch.float32),
+            "router_logits": torch.arange(12, dtype=torch.bfloat16).view(3, 4),
         }
 
-    install_fake_child(monkeypatch, output_factory=output_factory)
+    state = install_fake_child(monkeypatch, output_factory=output_factory)
     result = ffn.SglangFfnReferenceRunner(
         workdir=tmp_path / "reference",
         timeout_seconds=5,
-    ).run(model_path=model_path, tensor_parallel_size=1, cases=(make_case(),))[0]
+    ).run(
+        model_path=model_path,
+        tensor_parallel_size=1,
+        cases=(make_case(),),
+        moe_runner_backend="triton_kernels",
+        dtype="bfloat16",
+    )[0]
 
     assert result.routing is not None
     assert result.routing.topk_ids.dtype == torch.int32
     assert result.routing.topk_weights.dtype == torch.float32
     assert result.routing.topk_ids.tolist() == [[3, 1], [2, 0], [1, 3]]
+    assert result.router_logits is not None
+    torch.testing.assert_close(result.router_logits, torch.arange(12, dtype=torch.bfloat16).view(3, 4))
+    assert state["job"] is not None
+    assert state["job"].moe_runner_backend == "triton_kernels"
+    assert state["job"].dtype == "bfloat16"
 
 
 def test_runner_terminates_failed_child_without_returning_partial_results(

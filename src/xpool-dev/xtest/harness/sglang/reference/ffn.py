@@ -40,6 +40,7 @@ class SglangFfnReferenceResult:
     layer_id: int
     output: torch.Tensor
     routing: SglangFfnRoutingEvidence | None
+    router_logits: torch.Tensor | None = None
 
 
 class SglangFfnReferenceRunner:
@@ -57,6 +58,8 @@ class SglangFfnReferenceRunner:
         model_path: Path,
         tensor_parallel_size: int,
         cases: Sequence[SglangFfnReferenceCase],
+        moe_runner_backend: str = "auto",
+        dtype: str = "auto",
     ) -> tuple[SglangFfnReferenceResult, ...]:
         """Load one raw model, evaluate every case, and release the child.
 
@@ -75,6 +78,10 @@ class SglangFfnReferenceRunner:
         """
 
         deadline = time.monotonic() + self.timeout_seconds
+        if moe_runner_backend not in ("auto", "triton_kernels"):
+            raise ValueError("FFN reference requires auto or triton_kernels MoE backend")
+        if dtype not in ("auto", "bfloat16"):
+            raise ValueError("FFN reference dtype requires auto or bfloat16")
         if not model_path.is_dir():
             raise ValueError(f"FFN reference model_path is not a directory: {model_path}")
         visible_device_count = torch.cuda.device_count()
@@ -126,6 +133,8 @@ class SglangFfnReferenceRunner:
                 tensor_parallel_size=tensor_parallel_size,
                 workdir=self.workdir,
                 cases=tuple(case_specs),
+                moe_runner_backend=moe_runner_backend,
+                dtype=dtype,
             ),
             log_path=self.workdir / "child.log",
         )
@@ -158,6 +167,8 @@ def read_reference_result(
     except Exception as error:
         raise RuntimeError(f"FFN reference could not read {spec.output_path}: {error}") from error
     keys = set(tensors)
+    router_logits = tensors.get("router_logits")
+    keys.discard("router_logits")
     if keys == {"hidden_states"}:
         routing = None
     elif keys == {"hidden_states", "topk_ids", "topk_weights"}:
@@ -172,4 +183,5 @@ def read_reference_result(
         layer_id=case.layer_id,
         output=tensors["hidden_states"],
         routing=routing,
+        router_logits=router_logits,
     )

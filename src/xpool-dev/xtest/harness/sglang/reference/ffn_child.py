@@ -16,6 +16,7 @@ SUPPORTED_MODEL_CLASSES = frozenset(
     {
         "DeepseekV2ForCausalLM",
         "Glm4MoeLiteForCausalLM",
+        "GptOssForCausalLM",
         "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -86,7 +87,7 @@ def run_ffn_reference_rank(
         model_path=str(job.model_path),
         skip_tokenizer_init=True,
         trust_remote_code=False,
-        dtype="auto",
+        dtype=job.dtype,
         device="cuda",
         load_format="auto",
         tp_size=job.tensor_parallel_size,
@@ -98,7 +99,7 @@ def run_ffn_reference_rank(
         enable_dp_attention=True,
         enable_dp_lm_head=True,
         moe_a2a_backend="none",
-        moe_runner_backend="auto",
+        moe_runner_backend=job.moe_runner_backend,
         cuda_graph_backend_decode="disabled",
         cuda_graph_backend_prefill="disabled",
         disable_custom_all_reduce=True,
@@ -240,15 +241,31 @@ def execute_ffn_reference_case(
 
     # Rank zero records the router's actual carrier rather than reconstructing
     # routing from logits, preserving model-specific correction semantics.
-    topk = getattr(mlp, "topk", None)
+    topk = getattr(mlp, "topk", getattr(mlp, "top_k", None))
     if persist_result and topk is not None:
 
         def capture_topk(
             module: torch.nn.Module,
             inputs: tuple[torch.Tensor, ...],
-            output: sglang.srt.layers.moe.topk.StandardTopKOutput | sglang.srt.layers.moe.topk.StandardTopKOutputPacked,
+            output: object,
         ) -> None:
             del module, inputs
+            if isinstance(output, sglang.srt.layers.moe.topk.TritonKernelTopKOutput):
+                # Decode the actual Expert-major carrier back to its original
+                # token/slot order. Do not rerun TopK from logits.
+                counts = output.a_ragged_metadata.slice_sizes.detach().to(device="cpu", dtype=torch.int64)
+                scatter = output.scatter_indx.detach().to(device="cpu", dtype=torch.int64)
+                route_count = hidden_states.shape[0] * output.n_expts_act
+                if scatter.numel() != route_count or int(counts.sum()) != route_count:
+                    raise RuntimeError("FFN reference ragged TopK route cardinality disagrees")
+                if not torch.equal(scatter.sort().values, torch.arange(route_count)):
+                    raise RuntimeError("FFN reference ragged TopK scatter is not a complete permutation")
+                ids = torch.empty(route_count, dtype=torch.int32)
+                weights = torch.empty(route_count, dtype=torch.float32)
+                ids[scatter] = torch.repeat_interleave(torch.arange(counts.numel(), dtype=torch.int32), counts)
+                weights[scatter] = output.gate_scal.detach().to(device="cpu", dtype=torch.float32)
+                captured_routing.append((ids.view(-1, output.n_expts_act), weights.view(-1, output.n_expts_act)))
+                return
             if not isinstance(
                 output,
                 (
@@ -265,6 +282,19 @@ def execute_ffn_reference_case(
             )
 
         hook_handles.append(topk.register_forward_hook(capture_topk))
+
+    router = getattr(mlp, "router", None)
+    captured_logits: list[torch.Tensor] = []
+    if persist_result and router is not None:
+
+        def capture_router(module: torch.nn.Module, inputs: tuple[torch.Tensor, ...], output: object) -> None:
+            del module, inputs
+            logits = output[0] if isinstance(output, tuple) else output
+            if not isinstance(logits, torch.Tensor):
+                raise RuntimeError("FFN reference Router did not return logits")
+            captured_logits.append(logits.detach().to(device="cpu").contiguous())
+
+        hook_handles.append(router.register_forward_hook(capture_router))
 
     shared_expert_count = int(getattr(mlp, "n_shared_experts", getattr(mlp, "num_shared_experts", 0)) or 0)
     fused_shared_expert_count = int(getattr(mlp, "num_fused_shared_experts", 0) or 0)
@@ -334,6 +364,10 @@ def execute_ffn_reference_case(
             )
         output_tensors["topk_ids"] = topk_ids.contiguous()
         output_tensors["topk_weights"] = topk_weights.contiguous()
+    if router is not None:
+        if len(captured_logits) != 1:
+            raise RuntimeError("FFN reference must observe exactly one Router projection")
+        output_tensors["router_logits"] = captured_logits[0]
 
     with case.output_path.open("xb") as output_file:
         output_file.write(safetensors.torch.save(output_tensors))

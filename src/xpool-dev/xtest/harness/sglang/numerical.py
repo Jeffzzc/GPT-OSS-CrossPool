@@ -96,7 +96,9 @@ def run_numerical_case(
     ffn_tp_size = model.ffn_tp_size if model.ffn_tp_size is not None else len(config.ffn.devices)
     model_path = config.model_path_of(case.model_id)
     model_spec = architecture.load(model_id=case.model_id, model_path=model_path)
-    assert representative_layer_ids(model_spec.layers) == case.layer_ids
+    assert set(representative_layer_ids(model_spec.layers)).issubset(case.layer_ids)
+    assert len(set(case.layer_ids)) == len(case.layer_ids)
+    assert set(case.layer_ids).issubset(layer.layer_id for layer in model_spec.layers)
 
     hidden_states = generate_ffn_hidden_states(
         hidden_size=model_spec.hidden_size,
@@ -119,6 +121,8 @@ def run_numerical_case(
         model_path=model_path,
         tensor_parallel_size=ffn_tp_size,
         cases=reference_cases,
+        moe_runner_backend=case.reference_moe_runner_backend,
+        dtype=case.reference_dtype,
     )
 
     endpoint = TcpEndpointReservation.reserve(config.daemon.host, port_space=TcpPortSpace.local())

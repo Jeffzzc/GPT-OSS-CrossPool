@@ -194,6 +194,10 @@ def server_command(
     ]
     if model_config.atn_dp_size > 1:
         command.append("--enable-dp-attention")
+    if model.disable_hybrid_swa_memory:
+        command.append("--disable-hybrid-swa-memory")
+    if model.dtype != "auto":
+        command.extend(("--dtype", model.dtype))
     command.extend(
         (
             "--cuda-graph-backend-decode",

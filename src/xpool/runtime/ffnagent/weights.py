@@ -81,18 +81,30 @@ class MoeRouterWeights:
         weight: Routed-Expert Router tensor shaped ``[E_r, H]`` with model-owned precision.
         correction_bias: Optional corrected-routing FP32 tensor shaped
             ``[E_r]``.
+        projection_bias: Optional ordinary linear additive bias shaped
+            ``[E_r]``, using the weight dtype and applied before output rounding.
     """
 
     weight: torch.Tensor
     correction_bias: torch.Tensor | None
+    projection_bias: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
-        """Validate Router weight and optional correction bias."""
+        """Validate Router weight and independently represented optional biases."""
 
         router_dtype = self.weight.dtype
         if router_dtype not in (torch.bfloat16, torch.float16, torch.float32):
             raise ValueError("Router weights require BF16, FP16, or FP32")
         validate_weight_tensor(self.weight, name="router weight", dtype=router_dtype, dimensions=2)
+        if self.projection_bias is not None:
+            validate_weight_tensor(
+                self.projection_bias, name="router projection bias", dtype=router_dtype, dimensions=1
+            )
+            if (
+                self.projection_bias.shape != (self.weight.shape[0],)
+                or self.projection_bias.device != self.weight.device
+            ):
+                raise ValueError("Router projection bias geometry or device disagrees with its weight")
         if self.correction_bias is None:
             return
         validate_weight_tensor(
@@ -156,4 +168,74 @@ class MoeFfnWeights:
                 raise ValueError("MoE Router dimensions disagree with Expert weights")
 
 
-type FfnLayerWeights = DenseFfnWeights | MoeFfnWeights
+@dataclass(frozen=True, slots=True)
+class Mxfp4MoeFfnWeights:
+    """Packed E2M1 Experts with UE8M0 scales and interleaved W13 bias.
+
+    Each resource owns exact independent storage. Down bias is zero on TP
+    followers; the owner applies it before route weighting and TP reduction.
+
+    Attributes:
+        gate_up_blocks: uint8 E2M1 bytes shaped ``[E, 2*I_r, H/2]``, with
+            adjacent gate/up output rows and the low nibble first.
+        down_blocks: uint8 E2M1 bytes shaped ``[E, H, I_r/2]``.
+        gate_up_scales: uint8 UE8M0 scales shaped ``[E, 2*I_r, H/32]``.
+        down_scales: uint8 UE8M0 scales shaped ``[E, H, I_r/32]``.
+        gate_up_bias: BF16 interleaved additive bias shaped ``[E, 2*I_r]``.
+        down_bias: BF16 additive bias shaped ``[E, H]``, zero on TP followers.
+        router: Router-owner resources on TP rank zero, otherwise ``None``.
+    """
+
+    gate_up_blocks: torch.Tensor
+    down_blocks: torch.Tensor
+    gate_up_scales: torch.Tensor
+    down_scales: torch.Tensor
+    gate_up_bias: torch.Tensor
+    down_bias: torch.Tensor
+    router: MoeRouterWeights | None
+
+    def __post_init__(self) -> None:
+        """Validate the complete packed resource schema."""
+
+        if len({tensor.data_ptr() for tensor in self.resources()}) != 6:
+            raise ValueError("MXFP4 Expert resources must own six distinct storages")
+        for name in ("gate_up_blocks", "down_blocks", "gate_up_scales", "down_scales"):
+            validate_weight_tensor(getattr(self, name), name=name, dtype=torch.uint8, dimensions=3)
+        for name in ("gate_up_bias", "down_bias"):
+            validate_weight_tensor(getattr(self, name), name=name, dtype=torch.bfloat16, dimensions=2)
+        expert_count, twice_width, packed_hidden = self.gate_up_blocks.shape
+        hidden_size = packed_hidden * 2
+        local_width = twice_width // 2
+        if twice_width % 2 or hidden_size % 32 or local_width % 32:
+            raise ValueError("MXFP4 geometry requires complete 32-element blocks")
+        expected = {
+            "down_blocks": (expert_count, hidden_size, local_width // 2),
+            "gate_up_scales": (expert_count, twice_width, hidden_size // 32),
+            "down_scales": (expert_count, hidden_size, local_width // 32),
+            "gate_up_bias": (expert_count, twice_width),
+            "down_bias": (expert_count, hidden_size),
+        }
+        for name, shape in expected.items():
+            tensor = getattr(self, name)
+            if tuple(tensor.shape) != shape or tensor.device != self.gate_up_blocks.device:
+                raise ValueError(f"MXFP4 {name} geometry or device disagrees")
+        if self.router is not None:
+            if self.router.weight.shape != (expert_count, hidden_size):
+                raise ValueError("MXFP4 Router geometry disagrees")
+            if self.router.weight.device != self.gate_up_blocks.device:
+                raise ValueError("MXFP4 Router and Expert resources must share a device")
+
+    def resources(self) -> tuple[torch.Tensor, ...]:
+        """Return the six retained Expert storages in schema order."""
+
+        return (
+            self.gate_up_blocks,
+            self.down_blocks,
+            self.gate_up_scales,
+            self.down_scales,
+            self.gate_up_bias,
+            self.down_bias,
+        )
+
+
+type FfnLayerWeights = DenseFfnWeights | MoeFfnWeights | Mxfp4MoeFfnWeights

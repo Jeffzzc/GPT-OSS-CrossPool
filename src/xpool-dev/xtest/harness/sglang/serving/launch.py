@@ -35,6 +35,8 @@ def prepare(
         SglangLaunchModel(
             model_id=model_id,
             graph_mode=graph_mode,
+            disable_hybrid_swa_memory=case.disable_hybrid_swa_memory,
+            dtype=case.dtype,
         )
         for model_id in case.models
     )

@@ -24,6 +24,8 @@ class FfnReferenceJob:
     tensor_parallel_size: int
     workdir: Path
     cases: tuple[FfnReferenceCaseSpec, ...]
+    moe_runner_backend: str = "auto"
+    dtype: str = "auto"
 
 
 @dataclass(frozen=True, slots=True)

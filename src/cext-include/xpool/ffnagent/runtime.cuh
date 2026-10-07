@@ -33,6 +33,16 @@ struct LayerBindingValues {
   std::uintptr_t router_weight_address;
   /// Device address of router correction bias, or zero when absent.
   std::uintptr_t router_correction_bias_address;
+  /// Ordinary Router linear bias, or zero when absent.
+  std::uintptr_t router_projection_bias_address;
+  /// MXFP4 W13 scale address, or zero for floating-point weights.
+  std::uintptr_t gate_up_scales_address;
+  /// MXFP4 W2 scale address, or zero for floating-point weights.
+  std::uintptr_t down_scales_address;
+  /// Expert W13 bias address, or zero when absent.
+  std::uintptr_t gate_up_bias_address;
+  /// Expert W2 bias address, or zero when absent.
+  std::uintptr_t down_bias_address;
 };
 
 /// One lane/signature slice in the lane-owned Binding Site table.

@@ -137,14 +137,20 @@ class DeviceMemoryEstimator:
                 2 * payload_bytes * spec.hidden_size * local_width,
                 payload_bytes * spec.hidden_size * local_width,
             )
-        if layer.expert_intermediate_size % tp_size:
-            raise ValueError("MoE Expert intermediate size is not divisible by FFN TP")
-        local_width = layer.expert_intermediate_size // tp_size
+        local_width = ffn.local_intermediate_size(layer, tp_size)
         expert_count = layer.routed_expert_count + layer.shared_expert_count
         result = [
             2 * payload_bytes * expert_count * spec.hidden_size * local_width,
             payload_bytes * expert_count * spec.hidden_size * local_width,
         ]
+        if layer.expert_weight_kind is ffn.ExpertWeightKind.MXFP4:
+            result = list(
+                execution.mxfp4_expert_storage_bytes(
+                    expert_count=expert_count,
+                    hidden_size=spec.hidden_size,
+                    local_width=local_width,
+                )
+            )
         if tp_rank == 0:
             model_adapter = architecture.adapter_for(spec)
             if not issubclass(model_adapter, architecture.MoeFfnModelAdapter):
@@ -155,6 +161,8 @@ class DeviceMemoryEstimator:
             result.append(router_dtype.itemsize * layer.routed_expert_count * spec.hidden_size)
             if layer.checkpoint.router_correction_bias_key is not None:
                 result.append(4 * layer.routed_expert_count)
+            if layer.checkpoint.router_projection_bias_key is not None:
+                result.append(router_dtype.itemsize * layer.routed_expert_count)
         return tuple(result)
 
     def execution_runtime_bytes(

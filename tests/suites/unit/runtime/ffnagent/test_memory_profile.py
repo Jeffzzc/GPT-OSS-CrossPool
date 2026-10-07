@@ -138,6 +138,12 @@ def test_profile_world_config_preserves_required_scheduler_slo(tmp_path: Path) -
     assert XpoolConfig.from_file(path).scheduler.slo == source.scheduler.slo
 
 
+def test_packed_expert_domain_has_fit_and_held_out_coverage() -> None:
+    assert "C4" in corpus.FIT_COORDINATES
+    assert corpus.coordinate_members("C4", atnagent_count=1, ffnagent_count=4) == (("clamped-mxfp4-moe32", 2, 1, True),)
+    assert ("clamped-mxfp4-moe32", 4, 1, True) in corpus.coordinate_members("H0", atnagent_count=1, ffnagent_count=4)
+
+
 def test_coordinate_matrix_omits_unreachable_dense_tp2() -> None:
     assert corpus.coordinate_members("C2", atnagent_count=1, ffnagent_count=1)[0][1] == 1
     with pytest.raises(ValueError, match="unreachable"):

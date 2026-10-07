@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from xkit.serving.sglang.graph import SglangGraphMode
 from xpool.config import XpoolConfig
@@ -19,12 +20,16 @@ class SglangLaunchModel:
 
     model_id: ModelId
     graph_mode: SglangGraphMode
+    disable_hybrid_swa_memory: bool = False
+    dtype: Literal["auto", "bfloat16"] = "auto"
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_id, ModelId):
             raise ValueError("serving model_id must be a ModelId")
         if not isinstance(self.graph_mode, SglangGraphMode):
             raise ValueError("serving graph_mode must be a supported SGLang graph mode")
+        if self.dtype not in ("auto", "bfloat16") or not isinstance(self.disable_hybrid_swa_memory, bool):
+            raise ValueError("serving dtype or hybrid SWA memory policy is invalid")
 
 
 @dataclass(frozen=True, slots=True)

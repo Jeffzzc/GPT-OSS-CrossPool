@@ -14,8 +14,249 @@ from triton import language
 
 from xpool.ffn import ActivationKind
 from xpool.runtime.ffnagent import execution, weights
+from xpool.utils import align_up
 
 ROUTING_FINALIZATION_BLOCK_SIZE = 256
+
+
+@triton.jit
+def convert_bf16_topk_carrier_kernel(
+    ids_pointer,
+    weights_pointer,
+    output_ids_pointer,
+    output_weights_pointer,
+    ELEMENT_COUNT: language.constexpr,
+    BLOCK_SIZE: language.constexpr,
+):
+    """Preserve the reference's BF16 weight rounding in the FP32 Fabric carrier."""
+
+    offsets = language.program_id(0) * BLOCK_SIZE + language.arange(0, BLOCK_SIZE)
+    mask = offsets < ELEMENT_COUNT
+    ids = language.load(ids_pointer + offsets, mask, other=0)
+    values = language.load(weights_pointer + offsets, mask, other=0)
+    language.store(output_ids_pointer + offsets, ids.to(language.int32), mask)
+    language.store(output_weights_pointer + offsets, values.to(language.float32), mask)
+
+
+def compute_bf16_selected_softmax_topk(
+    *,
+    logits: torch.Tensor,
+    routed_ids: torch.Tensor,
+    routed_weights: torch.Tensor,
+    workspace: torch.Tensor,
+) -> None:
+    """Reuse pinned Triton TopK with caller-owned carriers and bitmatrix.
+
+    This backend selects raw BF16 logits with stable lower-ID tie breaking,
+    applies FP32 softmax only to selected logits, then rounds weights to BF16.
+    All temporary storage is supplied by the Router workspace.
+    """
+
+    from triton_kernels.topk_details._topk_forward import _topk_forward
+
+    rows, expert_count = logits.shape
+    topk = routed_ids.shape[1]
+    if logits.dtype is not torch.bfloat16 or expert_count != 32 or topk != 4:
+        raise ValueError("selected BF16 TopK supports the admitted 32-Expert TopK-4 geometry")
+    carrier_bytes = align_up(rows * topk * 2, 16)
+    padded_rows = align_up(rows, 32)
+    if workspace.numel() != 2 * carrier_bytes + padded_rows * 4:
+        raise ValueError("selected BF16 TopK workspace has the wrong extent")
+    values = workspace[: rows * topk * 2].view(torch.bfloat16).view(rows, topk)
+    ids = workspace[carrier_bytes : carrier_bytes + rows * topk * 2].view(torch.int16).view(rows, topk)
+    bitmatrix = workspace[2 * carrier_bytes :].view(torch.uint32)
+    _topk_forward[(triton.cdiv(rows, 32),)](
+        logits,
+        logits.stride(0),
+        (values,),
+        (ids,),
+        topk,
+        False,
+        (bitmatrix,),
+        1,
+        padded_rows,
+        rows,
+        expert_count,
+        0,
+        APPLY_SOFTMAX=True,
+        BLOCK_M=32,
+        BLOCK_N=32,
+        N_EXPTS_PAD=32,
+        N_EXPTS_ACT=4,
+    )
+    convert_bf16_topk_carrier_kernel[(triton.cdiv(rows * topk, 256),)](
+        ids,
+        values,
+        routed_ids,
+        routed_weights,
+        ELEMENT_COUNT=typing.cast(language.constexpr, rows * topk),
+        BLOCK_SIZE=typing.cast(language.constexpr, 256),
+    )
+
+
+def compute_biased_router_logits(
+    *,
+    hidden_states: torch.Tensor,
+    router_weights: weights.MoeRouterWeights,
+    logits: torch.Tensor,
+) -> None:
+    """Match the pinned BF16 Router projection into caller-owned logits.
+
+    The reference uses FlashInfer TinyGemm for small SM90/Blackwell batches
+    and a biased linear GEMM otherwise. Bias is accumulated before BF16 output
+    rounding; adding bias to an already rounded unbiased GEMM is different.
+    """
+
+    from sglang.srt.utils import is_flashinfer_available
+
+    capability = torch.cuda.get_device_capability(hidden_states.device)
+    if (
+        hidden_states.shape[0] <= 128
+        and is_flashinfer_available()
+        and (capability == (9, 0) or capability[0] in (10, 12))
+    ):
+        try:
+            from flashinfer.gemm import tinygemm_bf16
+        except ImportError:
+            tinygemm_bf16 = None
+        if tinygemm_bf16 is not None:
+            tinygemm_bf16(hidden_states, router_weights.weight, logits, router_weights.projection_bias, use_pdl=False)
+            return
+    if router_weights.projection_bias is None:
+        raise ValueError("biased Router projection requires ordinary projection bias")
+    torch.addmm(router_weights.projection_bias, hidden_states, router_weights.weight.t(), out=logits)
+
+
+@triton.jit
+def mxfp4_expert_matmul_kernel(
+    input_pointer,
+    blocks_pointer,
+    scales_pointer,
+    bias_pointer,
+    output_pointer,
+    route_weights_pointer,
+    sorted_ids_pointer,
+    expert_ids_pointer,
+    padded_count_pointer,
+    N: language.constexpr,
+    K: language.constexpr,
+    EXPERT_COUNT: language.constexpr,
+    ROUTE_COUNT: language.constexpr,
+    INPUT_TOPK: language.constexpr,
+    MULTIPLY_ROUTE: language.constexpr,
+    BLOCK_M: language.constexpr,
+    BLOCK_N: language.constexpr,
+    BLOCK_K: language.constexpr,
+):
+    """W4A16 GEMM: decode E2M1/UE8M0 tiles without a dequantized weight allocation."""
+
+    block_m = language.program_id(0)
+    if block_m * BLOCK_M >= language.load(padded_count_pointer):
+        return
+    routes = language.load(sorted_ids_pointer + block_m * BLOCK_M + language.arange(0, BLOCK_M))
+    columns = language.program_id(1) * BLOCK_N + language.arange(0, BLOCK_N)
+    expert = language.load(expert_ids_pointer + block_m)
+    output_offsets = routes[:, None] * N + columns[None, :]
+    output_mask = (routes[:, None] < ROUTE_COUNT) & (columns[None, :] < N)
+    if expert < 0 or expert >= EXPERT_COUNT:
+        language.store(output_pointer + output_offsets, 0.0, output_mask)
+        return
+    rows = routes // INPUT_TOPK
+    reductions = language.arange(0, BLOCK_K)
+    accumulator = language.full((BLOCK_M, BLOCK_N), 0, language.float32)
+    for block_k in range(language.cdiv(K, BLOCK_K)):
+        ks = block_k * BLOCK_K + reductions
+        a = language.load(
+            input_pointer + rows[:, None] * K + ks[None, :],
+            (routes[:, None] < ROUTE_COUNT) & (ks[None, :] < K),
+            other=0,
+        )
+        packed = language.load(
+            blocks_pointer + expert * N * (K // 2) + columns[None, :] * (K // 2) + ks[:, None] // 2,
+            (columns[None, :] < N) & (ks[:, None] < K),
+            other=0,
+        ).to(language.int32)
+        nibble = (packed >> ((ks[:, None] % 2) * 4)) & 15
+        magnitude = nibble & 7
+        value = language.where(
+            magnitude < 4,
+            magnitude.to(language.float32) * 0.5,
+            language.exp2((magnitude // 2 - 1).to(language.float32))
+            * (1.0 + (magnitude % 2).to(language.float32) * 0.5),
+        )
+        value = language.where((nibble & 8) != 0, -value, value)
+        exponent = language.load(
+            scales_pointer + expert * N * (K // 32) + columns[None, :] * (K // 32) + ks[:, None] // 32,
+            (columns[None, :] < N) & (ks[:, None] < K),
+            other=127,
+        ).to(language.int32)
+        b = (value * language.exp2((exponent - 127).to(language.float32))).to(language.bfloat16)
+        accumulator = language.dot(a, b, accumulator)
+    bias = language.load(bias_pointer + expert * N + columns, columns < N, other=0).to(language.float32)
+    result = accumulator + bias[None, :]
+    if MULTIPLY_ROUTE:
+        route_weights = language.load(route_weights_pointer + routes, routes < ROUTE_COUNT, other=0)
+        result *= route_weights[:, None]
+    language.store(output_pointer + output_offsets, result, output_mask)
+
+
+@triton.jit
+def clamped_swiglu_kernel(
+    gate_up_pointer,
+    output_pointer,
+    ELEMENT_COUNT: language.constexpr,
+    ALPHA: language.constexpr,
+    LIMIT: language.constexpr,
+    BLOCK_SIZE: language.constexpr,
+):
+    """Activate biased interleaved gate/up values using the exact GPT-OSS formula."""
+
+    offsets = language.program_id(0) * BLOCK_SIZE + language.arange(0, BLOCK_SIZE)
+    mask = offsets < ELEMENT_COUNT
+    gate = language.load(gate_up_pointer + 2 * offsets, mask, other=0).to(language.float32)
+    up = language.load(gate_up_pointer + 2 * offsets + 1, mask, other=0).to(language.float32)
+    gate = language.minimum(gate, LIMIT)
+    up = language.minimum(language.maximum(up, -LIMIT), LIMIT)
+    exponent = (-ALPHA * gate) * 1.4426950408889634
+    exponential = language.inline_asm_elementwise(
+        "ex2.approx.ftz.f32 $0, $1;",
+        "=r,r",
+        [exponent],
+        dtype=language.float32,
+        is_pure=True,
+        pack=1,
+    )
+    sigmoid_gate = gate / (1.0 + exponential)
+    activated = language.fma(sigmoid_gate, up, sigmoid_gate)
+    language.store(output_pointer + offsets, activated, mask)
+
+
+def compute_clamped_swiglu(
+    *,
+    gate_up: torch.Tensor,
+    output: torch.Tensor,
+    alpha: float,
+    clamp_limit: float,
+) -> None:
+    """Write clamped interleaved SwiGLU into caller-owned BF16 storage."""
+
+    if not math.isfinite(alpha) or not math.isfinite(clamp_limit) or min(alpha, clamp_limit) <= 0:
+        raise ValueError("clamped SwiGLU parameters must be finite and positive")
+    if gate_up.shape != (output.shape[0], output.shape[1] * 2):
+        raise ValueError("clamped SwiGLU input/output geometry disagrees")
+    if gate_up.dtype is not torch.float32 or output.dtype is not torch.bfloat16:
+        raise ValueError("clamped SwiGLU requires FP32 accumulators and BF16 output")
+    if gate_up.device != output.device or not gate_up.is_contiguous() or not output.is_contiguous():
+        raise ValueError("clamped SwiGLU tensors must be contiguous on one device")
+    clamped_swiglu_kernel[(triton.cdiv(output.numel(), 256),)](
+        gate_up,
+        output,
+        ELEMENT_COUNT=typing.cast(language.constexpr, output.numel()),
+        ALPHA=typing.cast(language.constexpr, alpha),
+        LIMIT=typing.cast(language.constexpr, clamp_limit),
+        BLOCK_SIZE=typing.cast(language.constexpr, 256),
+        enable_fp_fusion=False,
+    )
 
 
 @triton.jit
@@ -119,7 +360,7 @@ def copy_moe_kernel_config(config: object, *, name: str) -> dict[str, int]:
 
 def select_moe_kernel_configs(
     *,
-    layer_weights: weights.MoeFfnWeights,
+    layer_weights: weights.MoeFfnWeights | weights.Mxfp4MoeFfnWeights,
     row_capacity: int,
     effective_topk: int,
 ) -> tuple[dict[str, int], dict[str, int] | None]:
@@ -145,9 +386,20 @@ def select_moe_kernel_configs(
         is restored before return.
     """
 
-    expert_count = layer_weights.expert_gate_up_weight.shape[0]
+    expert_count = (
+        layer_weights.gate_up_blocks.shape[0]
+        if isinstance(layer_weights, weights.Mxfp4MoeFfnWeights)
+        else layer_weights.expert_gate_up_weight.shape[0]
+    )
     if row_capacity <= 0 or effective_topk <= 0 or effective_topk > expert_count:
         raise ValueError("MoE kernel selection dimensions are inconsistent")
+    if isinstance(layer_weights, weights.Mxfp4MoeFfnWeights):
+        return {
+            "BLOCK_SIZE_M": 16 if row_capacity <= 32 else 32,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+        }, None
 
     from sglang.srt.layers.moe.moe_runner.triton_utils import fused_moe_triton_config
 
@@ -256,7 +508,7 @@ def finalize_moe_routing(
 def compute_moe_partial(
     *,
     hidden_states: torch.Tensor,
-    layer_weights: weights.MoeFfnWeights,
+    layer_weights: weights.MoeFfnWeights | weights.Mxfp4MoeFfnWeights,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     sorted_token_ids: torch.Tensor,
@@ -271,6 +523,8 @@ def compute_moe_partial(
     w2_config: dict[str, int] | None,
     activation: ActivationKind,
     routed_scaling_factor: float,
+    activation_alpha: float | None = None,
+    activation_clamp_limit: float | None = None,
 ) -> torch.Tensor:
     """Compute one fixed-Capacity rank-local MoE Partial.
 
@@ -284,7 +538,8 @@ def compute_moe_partial(
         expert_ids: Caller-owned int32 aligned-block Expert IDs.
         num_tokens_post_padded: Caller-owned one-element int32 aligned count.
         cumsum_buffer: Caller-owned int32 alignment scratch.
-        gate_up: Caller-owned payload W13 output shaped ``[C * K, 2 * I_r]``.
+        gate_up: Caller-owned W13 output shaped ``[C * K, 2 * I_r]``;
+            MXFP4 retains FP32 accumulators through the activation epilogue.
         activated: Caller-owned payload activation shaped ``[C * K, I_r]``.
         route_outputs: Caller-owned payload W2 output shaped ``[C, K, H]``.
             Its storage may alias ``gate_up`` because their lifetimes do not
@@ -308,8 +563,16 @@ def compute_moe_partial(
         CUDA stream. It allocates no Torch output or persistent tensor.
     """
 
-    if activation is not ActivationKind.SILU:
-        raise ValueError(f"unsupported MoE activation {activation!r}")
+    packed = isinstance(layer_weights, weights.Mxfp4MoeFfnWeights)
+    if packed:
+        if (
+            activation is not ActivationKind.CLAMPED_SWIGLU
+            or activation_alpha is None
+            or activation_clamp_limit is None
+        ):
+            raise ValueError("MXFP4 execution requires explicit clamped SwiGLU semantics")
+    elif activation is not ActivationKind.SILU or activation_alpha is not None or activation_clamp_limit is not None:
+        raise ValueError("floating-point MoE execution requires ordinary SiLU")
     if not math.isfinite(routed_scaling_factor) or routed_scaling_factor <= 0:
         raise ValueError("MoE routed scaling factor must be finite and positive")
     payload_dtype = hidden_states.dtype
@@ -327,15 +590,24 @@ def compute_moe_partial(
         dimensions=1,
     )
     weights.validate_tensor(cumsum_buffer, name="alignment cumsum", dtype=torch.int32, dimensions=1)
-    weights.validate_tensor(gate_up, name="Expert gate/up output", dtype=payload_dtype, dimensions=2)
+    gate_up_dtype = torch.float32 if packed else payload_dtype
+    weights.validate_tensor(gate_up, name="Expert gate/up output", dtype=gate_up_dtype, dimensions=2)
     weights.validate_tensor(activated, name="Expert activation output", dtype=payload_dtype, dimensions=2)
     weights.validate_tensor(route_outputs, name="Expert route outputs", dtype=payload_dtype, dimensions=3)
     weights.validate_tensor(output, name="MoE Partial output", dtype=payload_dtype, dimensions=2)
 
     row_capacity, hidden_size = hidden_states.shape
-    expert_count, local_intermediate_twice, weight_hidden_size = layer_weights.expert_gate_up_weight.shape
+    if isinstance(layer_weights, weights.Mxfp4MoeFfnWeights):
+        expert_count, local_intermediate_twice, packed_hidden_size = layer_weights.gate_up_blocks.shape
+        weight_hidden_size = packed_hidden_size * 2
+        weight_dtype = layer_weights.gate_up_bias.dtype
+        expert_tensors = layer_weights.resources()
+    else:
+        expert_count, local_intermediate_twice, weight_hidden_size = layer_weights.expert_gate_up_weight.shape
+        weight_dtype = layer_weights.expert_gate_up_weight.dtype
+        expert_tensors = (layer_weights.expert_gate_up_weight, layer_weights.expert_down_weight)
     local_intermediate_size = local_intermediate_twice // 2
-    if weight_hidden_size != hidden_size or layer_weights.expert_gate_up_weight.dtype is not payload_dtype:
+    if weight_hidden_size != hidden_size or weight_dtype is not payload_dtype:
         raise ValueError("MoE input and Expert hidden dimensions disagree")
     if topk_ids.shape != topk_weights.shape or topk_ids.shape[0] != row_capacity:
         raise ValueError("MoE TopK id and weight dimensions disagree")
@@ -370,8 +642,7 @@ def compute_moe_partial(
 
     tensors = (
         hidden_states,
-        layer_weights.expert_gate_up_weight,
-        layer_weights.expert_down_weight,
+        *expert_tensors,
         topk_ids,
         topk_weights,
         sorted_token_ids,
@@ -387,7 +658,6 @@ def compute_moe_partial(
         raise ValueError("MoE Expert tensors must share one device")
 
     import sgl_kernel
-    from sglang.kernels.ops.moe.fused_moe_triton_kernels import invoke_fused_moe_kernel
 
     output_dtype = language.bfloat16 if payload_dtype is torch.bfloat16 else language.float16
     # The pinned extension writes the three caller-owned alignment buffers;
@@ -402,6 +672,65 @@ def compute_moe_partial(
         cumsum_buffer,
         True,
     )
+    if isinstance(layer_weights, weights.Mxfp4MoeFfnWeights):
+        for inputs, blocks, scales, bias, destination, width, reduction, input_topk, multiply in (
+            (
+                hidden_states,
+                layer_weights.gate_up_blocks,
+                layer_weights.gate_up_scales,
+                layer_weights.gate_up_bias,
+                gate_up,
+                local_intermediate_twice,
+                hidden_size,
+                effective_topk,
+                False,
+            ),
+            (
+                activated,
+                layer_weights.down_blocks,
+                layer_weights.down_scales,
+                layer_weights.down_bias,
+                route_outputs,
+                hidden_size,
+                local_intermediate_size,
+                1,
+                True,
+            ),
+        ):
+            mxfp4_expert_matmul_kernel[(expert_block_count, triton.cdiv(width, 64))](
+                inputs,
+                blocks,
+                scales,
+                bias,
+                destination,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                N=typing.cast(language.constexpr, width),
+                K=typing.cast(language.constexpr, reduction),
+                EXPERT_COUNT=typing.cast(language.constexpr, expert_count),
+                ROUTE_COUNT=typing.cast(language.constexpr, route_count),
+                INPUT_TOPK=typing.cast(language.constexpr, input_topk),
+                MULTIPLY_ROUTE=typing.cast(language.constexpr, multiply),
+                BLOCK_M=typing.cast(language.constexpr, block_size_m),
+                BLOCK_N=typing.cast(language.constexpr, 64),
+                BLOCK_K=typing.cast(language.constexpr, 64),
+                num_warps=4,
+                num_stages=3,
+            )
+            if not multiply:
+                compute_clamped_swiglu(
+                    gate_up=gate_up,
+                    output=activated,
+                    alpha=typing.cast(float, activation_alpha),
+                    clamp_limit=typing.cast(float, activation_clamp_limit),
+                )
+        sgl_kernel.moe_sum_reduce(route_outputs, output, routed_scaling_factor)
+        return output
+
+    from sglang.kernels.ops.moe.fused_moe_triton_kernels import invoke_fused_moe_kernel
+
     # Pinned SGLang exposes this launcher positionally: W13 consumes hidden
     # states and semantic routes, then writes the caller-owned Gate/Up tensor.
     invoke_fused_moe_kernel(
