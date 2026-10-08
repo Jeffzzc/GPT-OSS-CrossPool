@@ -37,7 +37,9 @@ local tensor evidence.
 - Match the pinned `triton_kernels` Router carrier: stable lower-Expert-ID
   tie breaking on BF16 logits, FP32 softmax of selected logits, BF16 weight
   rounding, then exact conversion to the Fabric FP32 carrier. The reference
-  suite explicitly selects this original SGLang MXFP4 backend; other backend
+  suite selects this original MXFP4 implementation with the SGLang 0.5.20
+  configuration value `moe_runner_backend="triton_kernel"`. The plural
+  `triton_kernels` names the Python package and Router carrier. Other backend
   routing policies are outside this first profile.
 - Derive TP width as `ceil((I/32)/TP)*32` everywhere. Zero-fill the tail of
   the last shard. Retain W2 bias only on rank zero before route weighting.

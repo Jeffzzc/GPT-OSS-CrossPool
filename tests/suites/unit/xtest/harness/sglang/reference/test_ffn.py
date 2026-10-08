@@ -139,6 +139,18 @@ def test_runner_rejects_invalid_requests_before_creating_workdir(
     with pytest.raises(ValueError, match="model_path"):
         runner.run(model_path=tmp_path / "missing", tensor_parallel_size=1, cases=(make_case(),))
 
+    for index, backend in enumerate(("", "invalid", "triton_kernels")):
+        workdir = tmp_path / f"backend-{index}"
+        runner = ffn.SglangFfnReferenceRunner(workdir=workdir, timeout_seconds=5)
+        with pytest.raises(ValueError, match="auto or triton_kernel MoE backend"):
+            runner.run(
+                model_path=model_path,
+                tensor_parallel_size=1,
+                cases=(make_case(),),
+                moe_runner_backend=backend,
+            )
+        assert not workdir.exists()
+
 
 def test_runner_preserves_order_normalizes_inputs_and_is_single_use(
     tmp_path: Path,
@@ -188,9 +200,11 @@ def test_runner_preserves_order_normalizes_inputs_and_is_single_use(
         runner.run(model_path=model_path, tensor_parallel_size=1, cases=(make_case(),))
 
 
+@pytest.mark.parametrize("moe_runner_backend", ("auto", "triton_kernel"))
 def test_runner_projects_moe_routing_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    moe_runner_backend: str,
 ) -> None:
     model_path = tmp_path / "model"
     model_path.mkdir()
@@ -212,7 +226,7 @@ def test_runner_projects_moe_routing_evidence(
         model_path=model_path,
         tensor_parallel_size=1,
         cases=(make_case(),),
-        moe_runner_backend="triton_kernels",
+        moe_runner_backend=moe_runner_backend,
         dtype="bfloat16",
     )[0]
 
@@ -223,7 +237,7 @@ def test_runner_projects_moe_routing_evidence(
     assert result.router_logits is not None
     torch.testing.assert_close(result.router_logits, torch.arange(12, dtype=torch.bfloat16).view(3, 4))
     assert state["job"] is not None
-    assert state["job"].moe_runner_backend == "triton_kernels"
+    assert state["job"].moe_runner_backend == moe_runner_backend
     assert state["job"].dtype == "bfloat16"
 
 

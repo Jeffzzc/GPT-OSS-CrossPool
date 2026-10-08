@@ -113,7 +113,8 @@ class E2eFfnNumericalCase(BaseModel):
     model_id: ModelId
     layer_ids: tuple[int, ...]
     input_matrix: E2eFfnInputMatrix
-    reference_moe_runner_backend: Literal["auto", "triton_kernels"] = "auto"
+    # SGLang 0.5.20 ServerArgs values; the Python package is named triton_kernels.
+    reference_moe_runner_backend: Literal["auto", "triton_kernel"] = "auto"
     reference_dtype: Literal["auto", "bfloat16"] = "auto"
     estimated_duration_seconds: float = Field(gt=0)
     timeout_seconds: float = Field(gt=0)

@@ -18,7 +18,9 @@ Remote metadata is insufficient evidence for the local checkpoint.
 The source reference is pinned [SGLang 0.5.20 GPT-OSS](https://github.com/sgl-project/sglang/blob/v0.5.20/python/sglang/srt/models/gpt_oss.py)
 and its [MXFP4 implementation](https://github.com/sgl-project/sglang/blob/v0.5.20/python/sglang/srt/layers/quantization/mxfp4.py).
 Numerical reference jobs disable CrossPool plugins and load the original model
-with `moe_runner_backend="triton_kernels"` and `dtype="bfloat16"`. They record
+with `moe_runner_backend="triton_kernel"` and `dtype="bfloat16"`. The backend
+value matches `MoeRunnerBackend.TRITON_KERNELS.value` in SGLang 0.5.20;
+`triton_kernels` remains the Python package name. They record
 actual Router logits and invert the original Expert-major TopK carrier into
 token/slot order. CrossPool operators do not produce reference tensors.
 
@@ -76,6 +78,24 @@ evidence must prove the requested graph structure and actual Breakable use.
 Timeout, skip, xfail and tolerance relaxation cannot replace acceptance.
 
 ## Server commands and invalidation
+
+For a reference backend configuration fix, first verify the pinned enum and
+run the focused reference-harness tests before model qualification:
+
+```bash
+uv run python - <<'PY'
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
+assert MoeRunnerBackend.TRITON_KERNELS.value == "triton_kernel"
+print(MoeRunnerBackend.TRITON_KERNELS.value)
+PY
+uv run pytest tests/suites/unit/xtest/harness/sglang/reference/test_ffn.py -v
+```
+
+Before qualification, verify MPS endpoint ownership for the selected attention
+device. An existing endpoint is an ownership conflict until its owner is
+identified and retired through the normal lifecycle. Preserve foreign endpoints
+and the fail-closed ownership checks. A startup ownership failure provides no
+FFN numerical or Graph replay verdict.
 
 Follow the [build requirements](../../../README.md#requirements),
 [installation instructions](../../tutorials/quick-start.md) and

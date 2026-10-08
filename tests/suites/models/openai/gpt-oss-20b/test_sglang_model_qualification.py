@@ -35,7 +35,7 @@ NUMERICAL_CASES = (
         model_id=MODEL,
         layer_ids=LAYERS,
         input_matrix=E2eFfnInputMatrix(seed=17, row_counts=ROWS),
-        reference_moe_runner_backend="triton_kernels",
+        reference_moe_runner_backend="triton_kernel",
         reference_dtype="bfloat16",
         estimated_duration_seconds=900,
         timeout_seconds=1800,
@@ -103,7 +103,7 @@ def test_checkpoint_router_projection_and_topk(
         model_path=model_path,
         tensor_parallel_size=2,
         cases=cases,
-        moe_runner_backend="triton_kernels",
+        moe_runner_backend="triton_kernel",
         dtype="bfloat16",
     )
     key_view = checkpoint.read_checkpoint_key_view(model_path)

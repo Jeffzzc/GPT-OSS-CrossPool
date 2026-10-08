@@ -67,6 +67,8 @@ class SglangFfnReferenceRunner:
             model_path: Existing raw model checkpoint directory.
             tensor_parallel_size: Number of SGLang tensor-parallel ranks.
             cases: Nonempty ordered FFN evaluation batch.
+            moe_runner_backend: Pinned SGLang 0.5.20 ServerArgs value, ``auto``
+                or ``triton_kernel``; passed unchanged to the isolated job.
 
         Returns:
             CPU results in the same order as ``cases``.
@@ -78,8 +80,8 @@ class SglangFfnReferenceRunner:
         """
 
         deadline = time.monotonic() + self.timeout_seconds
-        if moe_runner_backend not in ("auto", "triton_kernels"):
-            raise ValueError("FFN reference requires auto or triton_kernels MoE backend")
+        if moe_runner_backend not in ("auto", "triton_kernel"):
+            raise ValueError("FFN reference requires auto or triton_kernel MoE backend")
         if dtype not in ("auto", "bfloat16"):
             raise ValueError("FFN reference dtype requires auto or bfloat16")
         if not model_path.is_dir():
