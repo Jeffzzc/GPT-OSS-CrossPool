@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 import torch
 
-from xtest.harness.sglang.reference.diagnostics import ReferenceDiagnostics, routing_difference, tensor_difference
+from xtest.harness.sglang.reference.diagnostics import (
+    ReferenceDiagnostics,
+    cuda_kernel_inventory,
+    routing_difference,
+    tensor_difference,
+)
 
 
 def test_disabled_diagnostics_create_no_artifacts(tmp_path: Path) -> None:
@@ -51,3 +56,21 @@ def test_routing_difference_associates_weights_by_expert_id() -> None:
         torch.tensor([[0.75, 0.25]]), torch.tensor([[0.75, 0.25]])
     )
     assert result["sorted_ids"] == tensor_difference(torch.tensor([[1, 3], [0, 2]]), torch.tensor([[1, 3], [1, 2]]))
+
+
+def test_kernel_inventory_counts_cuda_launches_only(tmp_path: Path) -> None:
+    trace_path = tmp_path / "trace.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    {"cat": "kernel", "name": "cutlass::Kernel2"},
+                    {"cat": "kernel", "name": "cublasLt::splitKreduce_kernel"},
+                    {"cat": "kernel", "name": "cutlass::Kernel2"},
+                    {"cat": "cpu_op", "name": "aten::addmm"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert cuda_kernel_inventory(trace_path) == {"cublasLt::splitKreduce_kernel": 1, "cutlass::Kernel2": 2}

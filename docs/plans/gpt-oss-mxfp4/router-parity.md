@@ -20,6 +20,17 @@ profiles. The pinned unquantized implementation can dispatch through its BF16
 backend selection before its `F.linear` fallback. Record that selection rather
 than assuming every unquantized call uses the same GEMM.
 
+Pinned Torch 2.13 supplies a concrete mechanism to test. Its open-source CUDA
+build defaults to unified cuBLAS/Lt workspace. `getCUDABlasLtWorkspaceSize()`
+caps the Lt limit at the cuBLAS limit; `:0:0` therefore also limits Lt to zero.
+Biased GEMM passes that limit into cuBLASLt algorithm selection. This explains
+how a process policy can exclude scratch-using algorithms while leaving
+`F.linear` and caller-output `addmm` equivalent within each environment.
+See the pinned [workspace owner](https://github.com/pytorch/pytorch/blob/v2.13.0/aten/src/ATen/cuda/CublasHandlePool.cpp)
+and [biased GEMM](https://github.com/pytorch/pytorch/blob/v2.13.0/aten/src/ATen/cuda/CUDABlas.cpp).
+Confirm the installed effective byte limits and kernel traces before concluding
+that this mechanism explains every measured discrepancy.
+
 ## Evidence contract
 
 `SglangFfnReferenceRunner.run(diagnostics=True)` opts into rank-local JSONL
@@ -41,14 +52,26 @@ model cases retain the reference directory under the task artifact directory.
 The FFN numerical harness additionally joins reference logits/routes and
 observed production routes into `ffn-router-diagnostics.safetensors` and JSON.
 
-The exact Router test runs a second, Router-only child with the production
-workspace policy installed before any CUDA initialization. It reads only the
-checkpoint's Router weight/bias tensors and shared hidden-state prefixes. It
-captures the existing production Router operator at the derived graph
-capacities: rows 31/32 use capacity 32 and rows 33 use capacity 64. All buffers
-are allocated before capture; CPU copies and diagnostic profiling occur after
-replay. Its raw logits, IDs, weights, tensor geometry, environment and kernel
-traces remain separate from the inherited-environment reference evidence.
+The exact Router test runs two fresh Router-only children, explicitly unsetting
+`CUBLAS_WORKSPACE_CONFIG` in one and installing `:0:0` in the other before any
+CUDA initialization. They read identical checkpoint Router weight/bias tensors
+and hidden-state prefixes. Other GEMM controls remain inherited and unchanged.
+Each child evaluates the production Router at exact-row eager and exact-row
+Graph shapes, the selected Graph capacity, and both eager and Graph shapes at
+capacities 32 and 64 whenever they contain the live rows. Rows 4096 are retained
+as the shared-prefix control. All buffers are allocated before capture; CPU
+copies and profiling occur outside capture.
+
+`gpt-oss-router-workspace-ab.json` separates workspace differences at identical
+geometry, shape differences under one policy, and eager/Graph differences at
+identical geometry. It also compares each policy/variant to the saved original
+SGLang reference. Each policy directory retains raw logits, IDs, weights,
+geometry, effective cuBLAS/Lt workspace byte limits, kernel launch inventories
+and Chrome traces. No policy setting is changed in the original reference.
+The original reference queries effective workspace limits only after its entire
+FFN batch is saved, because Torch caches environment-derived defaults when
+those getters first run. Fresh-policy probes query them after installing their
+policy and before their first GEMM.
 
 This isolated capacity probe is not a live FfnAgent Lane Graph observation.
 The existing Routing Observer supplies actual production IDs/weights; it does
@@ -109,3 +132,24 @@ Alternatively, an actual-row-count projection during fixed-capacity execution
 requires an accepted operator/graph design. Neither alternative is implemented
 or accepted by this diagnostic change. Expert MXFP4 execution, TP slicing,
 W13/W2 and serving Graph resource schemas remain outside its scope.
+
+## Candidate repair after the experiment
+
+If workspace alone explains the discrepancy, keep the existing Router bias,
+TopK and Expert mathematics. A production repair must supply the required Lt
+scratch with explicit ownership, memory accounting and Lane address relocation.
+Removing the process policy, enlarging it, or separating the global Lt pool
+does not by itself prove those properties: captured handles can retain scratch
+addresses outside the declared Lane workspace, and concurrent Lanes must not
+write the same scratch allocation.
+
+The scoped candidate is a caller-workspace biased GEMM at the existing operator
+seam, with scratch included in the Router workspace derivation and the existing
+Lane workspace projection. It must reproduce the reference's admitted GEMM
+geometry, descriptors, reduction policy and effective workspace limit, and pass
+Primary/Control discovery, per-layer rebinding, concurrent-Lane resource tests,
+memory calibration and numerical/serving qualification. This is a candidate,
+not an accepted core implementation or evidence that a new native API is
+necessarily required. If shape still changes BF16 results after workspace is
+matched, resolving actual-row-count projection is a separate Graph design
+decision; this experiment does not authorize a changed reference or tolerance.

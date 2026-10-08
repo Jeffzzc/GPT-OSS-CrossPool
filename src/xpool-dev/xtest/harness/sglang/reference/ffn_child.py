@@ -224,6 +224,11 @@ def evaluate_ffn_reference_rank(
                 torch.distributed.barrier()
         # Complete the entire normative FFN batch before diagnostic GEMMs can
         # warm allocator/BLAS caches or initialize profiler state.
+        if job.diagnostics:
+            (job.workdir / f"rank-{tensor_parallel_rank}-gemm-environment.json").write_text(
+                json.dumps(diagnostics.cuda_gemm_environment(include_workspace_limits=True), indent=2) + "\n",
+                encoding="utf-8",
+            )
         if job.diagnostics and tensor_parallel_rank == 0:
             import safetensors.torch
 

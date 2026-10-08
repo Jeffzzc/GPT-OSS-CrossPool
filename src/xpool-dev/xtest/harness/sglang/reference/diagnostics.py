@@ -9,6 +9,7 @@ import inspect
 import json
 import os
 import time
+from collections import Counter
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -85,8 +86,12 @@ def tensor_geometry(tensor: torch.Tensor) -> dict[str, object]:
     }
 
 
-def cuda_gemm_environment() -> dict[str, object]:
-    """Record relevant GEMM controls without changing flags, workspaces or backend selection."""
+def cuda_gemm_environment(*, include_workspace_limits: bool = False) -> dict[str, object]:
+    """Record GEMM controls; query cached workspace limits only after normative GEMMs or in a fresh-policy probe.
+
+    Torch's workspace getters cache environment-derived defaults on first use.
+    Original-reference callers defer those getters until their FFN batch is saved.
+    """
 
     device = torch.cuda.current_device()
     versions: dict[str, str | None] = {}
@@ -95,7 +100,7 @@ def cuda_gemm_environment() -> dict[str, object]:
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             versions[name] = None
-    return {
+    snapshot: dict[str, object] = {
         "packages": versions,
         "pid": os.getpid(),
         "device_index": device,
@@ -107,6 +112,7 @@ def cuda_gemm_environment() -> dict[str, object]:
         "blas_library": str(torch.backends.cuda.preferred_blas_library()),
         "fp32_precision": torch.backends.cuda.matmul.fp32_precision,
         "allow_bf16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        "allow_bf16_split_k": torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction_split_k,
         "allow_fp16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
         "environment": {
             name: os.environ.get(name)
@@ -115,6 +121,7 @@ def cuda_gemm_environment() -> dict[str, object]:
                 "CUBLAS_WORKSPACE_CONFIG",
                 "CUBLAS_WORKSPACE_SIZE",
                 "CUBLASLT_WORKSPACE_SIZE",
+                "TORCH_CUBLASLT_UNIFIED_WORKSPACE",
                 "DISABLE_ADDMM_CUDA_LT",
                 "NVIDIA_TF32_OVERRIDE",
                 "SGLANG_ENABLE_BF16_SPLITK_GEMM",
@@ -124,6 +131,10 @@ def cuda_gemm_environment() -> dict[str, object]:
             )
         },
     }
+    if include_workspace_limits:
+        snapshot["cublas_workspace_bytes"] = torch.backends.cuda.cublas_workspace_size()
+        snapshot["cublaslt_workspace_bytes"] = torch.backends.cuda.cublaslt_workspace_size()
+    return snapshot
 
 
 def tensor_difference(expected: torch.Tensor, actual: torch.Tensor) -> dict[str, object]:
@@ -186,6 +197,17 @@ def profile_projection(path: Path, calls: dict[str, Callable[[], torch.Tensor]])
                 outputs[name] = call()
     profile.export_chrome_trace(str(path))
     return outputs
+
+
+def cuda_kernel_inventory(path: Path) -> dict[str, int]:
+    """Summarize CUDA kernel launch names from the dynamic Kineto Chrome-trace schema."""
+
+    trace = json.loads(path.read_text(encoding="utf-8"))
+    counts: Counter[str] = Counter()
+    for event in trace["traceEvents"]:
+        if event.get("cat") == "kernel":
+            counts[event["name"]] += 1
+    return dict(sorted(counts.items()))
 
 
 def module_implementation(module: torch.nn.Module) -> dict[str, object]:

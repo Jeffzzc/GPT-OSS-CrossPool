@@ -129,12 +129,37 @@ def test_checkpoint_router_projection_and_topk(
             key = f"model.layers.{layer_id}.mlp.router.{suffix}"
             with safe_open(str(key_view[key]), framework="pt", device="cpu") as shard:
                 probe_inputs[f"layer-{layer_id}.{suffix}"] = shard.get_tensor(key)
-    evidence = router_probe.run_production_router_probe(
+    evidence = router_probe.run_router_projection_probe(
         workdir=artifact_dir / "router-production-probe",
         tensors=probe_inputs,
         layer_ids=LAYERS,
         row_counts=ROWS,
         timeout_seconds=remaining_seconds(deadline, "production Router environment probe"),
+        workspace_policy=":0:0",
+    )
+    unset_evidence = router_probe.run_router_projection_probe(
+        workdir=artifact_dir / "router-unset-probe",
+        tensors=probe_inputs,
+        layer_ids=LAYERS,
+        row_counts=ROWS,
+        timeout_seconds=remaining_seconds(deadline, "unset Router environment probe"),
+        workspace_policy="unset",
+    )
+    reference_evidence = {}
+    for result in results:
+        assert result.router_logits is not None and result.routing is not None
+        reference_evidence[f"{result.case_id}.reference_logits"] = result.router_logits
+        reference_evidence[f"{result.case_id}.reference_ids"] = result.routing.topk_ids
+        reference_evidence[f"{result.case_id}.reference_weights"] = result.routing.topk_weights
+    (artifact_dir / "gpt-oss-router-workspace-ab.json").write_text(
+        json.dumps(
+            router_probe.summarize_workspace_ab(
+                reference=reference_evidence, unset=unset_evidence, zero=evidence, layer_ids=LAYERS, row_counts=ROWS
+            ),
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
     )
     samples: dict[str, object] = {}
     (artifact_dir / "gpt-oss-router-environment.json").write_text(
