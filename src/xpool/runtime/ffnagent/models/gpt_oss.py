@@ -6,6 +6,7 @@ import torch
 
 from xpool import ffn
 from xpool.model import ModelId
+from xpool.native import ffnagent
 from xpool.native.ffn import LayerKind
 from xpool.runtime.ffnagent import architecture, operators, weights
 from xpool.utils import align_up
@@ -15,6 +16,22 @@ class GptOssAdapter(architecture.MoeFfnModelAdapter):
     """Compile only the inspected GPT-OSS-20B checkpoint profile."""
 
     architecture_name = "GptOssForCausalLM"
+
+    @staticmethod
+    def router_workspace_layout(*, payload_row_capacity: int) -> tuple[int, int, int]:
+        """Return logits end, TopK end and aligned Lt scratch offset, in bytes.
+
+        The enclosing workspace starts on a 256-byte boundary. Logits remain
+        its first region so retained numerical probes can observe them directly.
+        Scratch is Lane-owned even on devices whose TinyGemm path does not use it.
+        """
+
+        if payload_row_capacity <= 0:
+            raise ValueError("GPT-OSS Router capacity must be positive")
+        logits_end = payload_row_capacity * 32 * torch.bfloat16.itemsize
+        carrier_bytes = align_up(payload_row_capacity * 4 * 2, 16)
+        topk_end = logits_end + 2 * carrier_bytes + align_up(payload_row_capacity, 32) * 4
+        return logits_end, topk_end, align_up(topk_end, ffnagent.BIASED_ROUTER_GEMM_ALIGNMENT_BYTES)
 
     @staticmethod
     def router_weight_dtype(*, payload_dtype: torch.dtype) -> torch.dtype:
@@ -33,14 +50,13 @@ class GptOssAdapter(architecture.MoeFfnModelAdapter):
         routed_expert_count: int,
         routed_topk: int,
     ) -> int:
-        """Return caller-owned BF16 logits for the admitted Router geometry."""
+        """Account for BF16 logits, TopK carriers and explicit Lt scratch."""
 
         GptOssAdapter.router_weight_dtype(payload_dtype=payload_dtype)
         if payload_row_capacity <= 0 or (hidden_size, routed_expert_count, routed_topk) != (2880, 32, 4):
             raise ValueError("GPT-OSS Router geometry is outside the admitted profile")
-        logits_bytes = payload_row_capacity * routed_expert_count * payload_dtype.itemsize
-        carrier_bytes = align_up(payload_row_capacity * routed_topk * 2, 16)
-        return logits_bytes + 2 * carrier_bytes + align_up(payload_row_capacity, 32) * 4
+        _, _, scratch_offset = GptOssAdapter.router_workspace_layout(payload_row_capacity=payload_row_capacity)
+        return scratch_offset + ffnagent.BIASED_ROUTER_GEMM_WORKSPACE_BYTES
 
     @staticmethod
     def compute_routed_topk(
@@ -80,16 +96,19 @@ class GptOssAdapter(architecture.MoeFfnModelAdapter):
         tensors = (workspace, router_weights.weight, router_weights.projection_bias, routed_ids, routed_weights)
         if any(tensor.device != hidden_states.device for tensor in tensors):
             raise ValueError("GPT-OSS Router tensors must share one device")
-        logits_bytes = rows * expert_count * torch.bfloat16.itemsize
+        logits_bytes, topk_end, scratch_offset = GptOssAdapter.router_workspace_layout(payload_row_capacity=rows)
         logits = workspace[:logits_bytes].view(torch.bfloat16).view(rows, expert_count)
         operators.compute_biased_router_logits(
-            hidden_states=hidden_states, router_weights=router_weights, logits=logits
+            hidden_states=hidden_states,
+            router_weights=router_weights,
+            logits=logits,
+            workspace=workspace[scratch_offset:],
         )
         operators.compute_bf16_selected_softmax_topk(
             logits=logits,
             routed_ids=routed_ids,
             routed_weights=routed_weights,
-            workspace=workspace[logits_bytes:],
+            workspace=workspace[logits_bytes:topk_end],
         )
 
     @classmethod

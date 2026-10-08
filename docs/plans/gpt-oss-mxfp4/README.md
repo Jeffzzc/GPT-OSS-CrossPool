@@ -58,6 +58,43 @@ local tensor evidence.
 
 ## Interface Changes
 
+### SM80 Router GEMM workspace
+
+The Router repair keeps the FfnAgent's process-wide zero-workspace policy.
+Pinned Torch 2.13's biased BF16 cuBLASLt descriptors and first-result heuristic
+are reproduced at the existing native FFN operator seam, with an explicit
+1 MiB caller-owned workspace, matching Torch's default Lt algorithm budget.
+The BF16 bias epilogue precedes output rounding. BF16 reduction preferences
+remain those of the pinned Torch context. No algorithm ID is hardcoded and
+heuristic or execution failures fail closed. SM90/Blackwell TinyGemm and other
+model adapters retain their existing dispatch.
+
+GPT-OSS Router workspace contains BF16 logits, the existing TopK carriers,
+alignment padding and the Lt scratch. Its outer region and scratch offset are
+256-byte aligned. The scratch is part of the existing compute-workspace span:
+Primary/Control capture shares that span; installation relocates its interior
+pointers into each Lane's independently allocated workspace. Layer weight and
+bias pointers use existing resource discovery and device-side binding sites,
+including sites in a separate Split-K reduction kernel. No new resource table,
+allocator, retained handle owner or replay allocation is introduced.
+
+The native API accepts contiguous BF16 input, weight, bias and destination,
+plus a disjoint uint8 workspace on the same BF16-capable device. Production
+selects this path only on SM80. It borrows Torch's
+current Lt handle and current stream, creates temporary host descriptors, and
+supplies only caller-owned device scratch. Calls occur during warmup/capture;
+replay executes captured kernels. Scratch size enters the execution signature,
+capture and per-Lane memory accounting through the adapter's existing byte
+derivation. Increment the native ABI to invalidate stale binaries/calibration.
+
+Validation requires unchanged original-SGLang logits, IDs and rounded weights
+for all 15 layer/row combinations in both fresh-process workspace environments,
+exact/capacity eager/Graph parity, repeated input changes, and real cuBLASLt
+Primary/Control discovery, device rebinding and concurrent Lane relocation.
+Synthetic tests cover workspace extent/alignment, overlap rejection and replay
+allocation. Re-run all eight model qualification cases and memory calibration
+on the target hardware; unexecuted hardware checks confer no support claim.
+
 `ActivationKind` gains clamped SwiGLU; model and execution signatures include
 alpha and clamp limit. MoE specs gain an explicit Expert weight kind and packed
 checkpoint keys. Old adapters keep floating-point defaults. Router owners and

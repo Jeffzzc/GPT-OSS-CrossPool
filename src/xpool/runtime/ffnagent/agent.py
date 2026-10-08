@@ -44,6 +44,8 @@ class FfnAgent(Agent):
 
         if torch.cuda.is_initialized():
             raise AgentError("FfnAgent CUDA initialized before installing its cuBLAS workspace policy")
+        # Implicit per-handle/stream BLAS scratch cannot be relocated into each
+        # Lane. Operators requiring scratch supply accounted Lane storage.
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":0:0"
         super().__init__(device=device, runtime_role=RuntimeRole.FFNAGENT)
         ensure_supported_cuda_allocator()

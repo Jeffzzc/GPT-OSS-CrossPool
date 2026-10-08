@@ -197,6 +197,7 @@ def run_router_projection_child(connection: Connection, job: RouterProjectionJob
     """Evaluate exact and padded shapes without constructing a model or changing production code."""
 
     install_router_workspace_policy(job.workspace_policy)
+    from xpool.native import ffnagent
     from xpool.runtime.ffnagent import execution, weights
     from xpool.runtime.ffnagent.models.gpt_oss import GptOssAdapter
 
@@ -289,6 +290,10 @@ def run_router_projection_child(connection: Connection, job: RouterProjectionJob
                             "weight": diagnostics.tensor_geometry(router.weight),
                             "bias": diagnostics.tensor_geometry(router.projection_bias),
                             "workspace": diagnostics.tensor_geometry(workspace),
+                            "explicit_lt_scratch": diagnostics.tensor_geometry(
+                                workspace[GptOssAdapter.router_workspace_layout(payload_row_capacity=size)[2] :]
+                            ),
+                            "explicit_lt_budget_bytes": ffnagent.BIASED_ROUTER_GEMM_WORKSPACE_BYTES,
                             "logits": diagnostics.tensor_geometry(logits),
                             "kernels": diagnostics.cuda_kernel_inventory(trace_path),
                         }

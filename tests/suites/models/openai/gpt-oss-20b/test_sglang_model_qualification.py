@@ -17,7 +17,7 @@ import xtest
 from xkit.deployment import resolve_deployment_path
 from xkit.serving.sglang.graph import SglangGraphMode
 from xpool.model import ModelId
-from xpool.runtime.ffnagent import architecture, checkpoint, weights
+from xpool.runtime.ffnagent import architecture, checkpoint, execution, weights
 from xpool.runtime.ffnagent.models.gpt_oss import GptOssAdapter
 from xtest.harness.runner.requirements import ResolvedConfig
 from xtest.harness.sglang import numerical
@@ -314,3 +314,21 @@ def test_checkpoint_router_projection_and_topk(
         torch.testing.assert_close(
             evidence[f"{case.case_id}.actual_weights"], result.routing.topk_weights, rtol=0, atol=0
         )
+        # The FfnAgent policy must pass the same strict assertions as the
+        # independent, unchanged SGLang baseline. Shape and capture variants
+        # are retained separately; neither control changes the reference.
+        capacity = next(
+            value
+            for value in execution.derive_payload_row_capacities(ROWS[-1])
+            if value >= case.hidden_states.shape[0]
+        )
+        for policy_evidence in (evidence, unset_evidence):
+            for name, _, _ in router_probe.projection_variants(case.hidden_states.shape[0], capacity):
+                for suffix, expected in (
+                    ("logits", result.router_logits),
+                    ("ids", result.routing.topk_ids),
+                    ("weights", result.routing.topk_weights),
+                ):
+                    torch.testing.assert_close(
+                        policy_evidence[f"{case.case_id}.{name}_{suffix}"], expected, rtol=0, atol=0
+                    )

@@ -21,6 +21,7 @@ from xpool.ffn import FfnModelSpec
 from xpool.memory import MIB, SIGNED_INT64_MAX, FfnMemoryCalibrationCoefficients
 from xpool.runtime.ffnagent import device_memory, execution
 from xpool.runtime.ffnagent.memory_profile import corpus
+from xpool.runtime.ffnagent.models.gpt_oss import GptOssAdapter
 from xpool.service.daemon.ffn_placement import place_ffn_models
 from xtest.harness.support.config import TEST_MODEL_ID, install_test_config, reset_global_config
 from xtest.harness.support.native.sizing import install_native_allocation_sizing
@@ -136,6 +137,54 @@ def test_mxfp4_memory_counts_packed_resources_and_block_aligned_tp() -> None:
                 0, 0, rank
             )
     assert corpus.build_model_plan(spec, tp_size=4).layers[0].local_intermediate_size == width
+
+
+def test_router_scratch_enters_each_lane_and_each_capture_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = corpus.calibration_corpus_spec("clamped-mxfp4-moe32")
+    profile = corpus.build_instance_profile(spec, group_sum_complete=False)
+    install_test_config(
+        XpoolConfig.from_mapping(
+            {
+                "scheduler": {"slo": {"ttft_ms": 1000, "tbt_ms": 50}, "ffn_concurrency": 2},
+                "atn": {"devices": [0]},
+                "ffn": {"devices": [1, 2]},
+                "models": [{"id": spec.model_id, "path": "/models/mxfp4", "ffn_tp_size": 2}],
+            }
+        )
+    )
+    estimator = device_memory.DeviceMemoryEstimator(model_specs=(spec,), instance_profiles=(profile,))
+    plans = (corpus.build_model_plan(spec, tp_size=2),)
+    with_scratch = estimator.allocation_ledger_for_model_plans(model_plans=plans, ffnagent_index=0)
+    follower = estimator.allocation_ledger_for_model_plans(model_plans=plans, ffnagent_index=1)
+    original = GptOssAdapter.router_workspace_bytes
+
+    def without_scratch(
+        *,
+        payload_dtype: torch.dtype,
+        payload_row_capacity: int,
+        hidden_size: int,
+        routed_expert_count: int,
+        routed_topk: int,
+    ) -> int:
+        return original(
+            payload_dtype=payload_dtype,
+            payload_row_capacity=payload_row_capacity,
+            hidden_size=hidden_size,
+            routed_expert_count=routed_expert_count,
+            routed_topk=routed_topk,
+        ) - MIB
+
+    monkeypatch.setattr(GptOssAdapter, "router_workspace_bytes", staticmethod(without_scratch))
+    baseline = estimator.allocation_ledger_for_model_plans(model_plans=plans, ffnagent_index=0)
+    assert with_scratch[-1].exact_resource_ledger_bytes - baseline[-1].exact_resource_ledger_bytes == 2 * MIB
+    assert (
+        with_scratch[2].features.tensor_storage_allocation_count == baseline[2].features.tensor_storage_allocation_count
+    )
+    assert (
+        with_scratch[2].features.tensor_storage_bytes - baseline[2].features.tensor_storage_bytes
+        == with_scratch[2].features.moe_graph_capture_count * MIB
+    )
+    assert follower == estimator.allocation_ledger_for_model_plans(model_plans=plans, ffnagent_index=1)
 
 
 def test_exact_dense_allocation_ledger_and_feature_rows() -> None:
