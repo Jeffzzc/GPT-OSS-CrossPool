@@ -121,6 +121,9 @@ Only a successful required qualification permits changing the support table.
 The [validation contract and file scope](validation.md) lists checkpoint
 invariants, diagnostic evidence, rebuild/calibration requirements and server
 commands for this change.
+The [Router investigation contract](router-parity.md) defines opt-in
+rank diagnostics, fresh-process workspace comparisons, capacity probes and
+the review boundary for any proposed numerical-compatibility change.
 
 ## Out of Scope
 

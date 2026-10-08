@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from itertools import pairwise
@@ -24,6 +25,7 @@ from xtest.harness.native.ffn.protocol import FfnInstanceSpec, FfnInvocationSpec
 from xtest.harness.native.ffn.topology import ffn_cluster_environment, materialize_ffn_cluster_launch, run_ffn_topology
 from xtest.harness.runner.requirements import ResolvedConfig
 from xtest.harness.sglang.catalog import E2eFfnNumericalCase
+from xtest.harness.sglang.reference import diagnostics
 from xtest.harness.sglang.reference.ffn import SglangFfnReferenceCase, SglangFfnReferenceRunner
 from xtest.harness.support.ffn import (
     FFN_NUMERICAL_ARTIFACT_FILENAME,
@@ -115,7 +117,7 @@ def run_numerical_case(
         for row_count, values in zip(case.input_matrix.row_counts, hidden_states, strict=True)
     )
     reference_results = SglangFfnReferenceRunner(
-        workdir=tmp_path / "reference",
+        workdir=(task_artifact_dir or tmp_path) / "reference" if case.reference_diagnostics else tmp_path / "reference",
         timeout_seconds=remaining_seconds(deadline, "FFN numerical Reference"),
     ).run(
         model_path=model_path,
@@ -123,6 +125,7 @@ def run_numerical_case(
         cases=reference_cases,
         moe_runner_backend=case.reference_moe_runner_backend,
         dtype=case.reference_dtype,
+        diagnostics=case.reference_diagnostics,
     )
 
     endpoint = TcpEndpointReservation.reserve(config.daemon.host, port_space=TcpPortSpace.local())
@@ -193,6 +196,8 @@ def run_numerical_case(
 
     observed_routing = read_ffn_routing_records(production_workdir / "observers", ready.generation)
     samples: list[FfnNumericalSampleEvidence] = []
+    router_tensors: dict[str, torch.Tensor] = {}
+    router_samples: dict[str, object] = {}
     reference_by_id = {result.case_id: result for result in reference_results}
     for invocation_sequence, invocation in enumerate(invocations, start=1):
         reference = reference_by_id[invocation.case_id]
@@ -226,6 +231,16 @@ def run_numerical_case(
                 atol=FFN_ROUTING_ATOL,
                 rtol=FFN_ROUTING_RTOL,
             )
+            if case.reference_diagnostics and reference.router_logits is not None:
+                prefix = invocation.case_id
+                router_tensors[f"{prefix}.reference_logits"] = reference.router_logits
+                router_tensors[f"{prefix}.reference_ids"] = reference.routing.topk_ids
+                router_tensors[f"{prefix}.reference_weights"] = reference.routing.topk_weights
+                router_tensors[f"{prefix}.production_ids"] = actual_ids
+                router_tensors[f"{prefix}.production_weights"] = actual_weights
+                router_samples[prefix] = diagnostics.routing_difference(
+                    reference.routing.topk_ids, reference.routing.topk_weights, actual_ids, actual_weights
+                )
         elif reference.routing is not None:
             raise AssertionError("Dense Reference unexpectedly returned Routing evidence")
         samples.append(
@@ -245,6 +260,13 @@ def run_numerical_case(
         samples=tuple(samples),
     )
     evidence.write((task_artifact_dir or tmp_path) / FFN_NUMERICAL_ARTIFACT_FILENAME)
+    if router_tensors:
+        safetensors.torch.save_file(
+            router_tensors, (task_artifact_dir or tmp_path) / "ffn-router-diagnostics.safetensors"
+        )
+        ((task_artifact_dir or tmp_path) / "ffn-router-diagnostics.json").write_text(
+            json.dumps(router_samples, indent=2) + "\n", encoding="utf-8"
+        )
     assert all(sample.output.passed for sample in samples)
     assert all(sample.routing is None or sample.routing.passed for sample in samples)
 

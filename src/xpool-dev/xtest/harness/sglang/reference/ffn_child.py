@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import typing
@@ -9,7 +10,7 @@ from multiprocessing.connection import Connection
 
 import torch
 
-from xtest.harness.sglang.reference import ffn_protocol
+from xtest.harness.sglang.reference import diagnostics, ffn_protocol
 
 SGLANG_PLUGIN_SENTINEL = "__xpool_sglang_ffn_reference_no_plugins__"
 SUPPORTED_MODEL_CLASSES = frozenset(
@@ -30,6 +31,8 @@ def run_ffn_reference_child(
 ) -> None:
     """Run every TP rank after isolating the original SGLang plugin set."""
 
+    progress = diagnostics.ReferenceDiagnostics(job.workdir, "parent", job.diagnostics)
+    progress.event("process", "start", tensor_parallel_size=job.tensor_parallel_size)
     os.environ["SGLANG_PLUGINS"] = SGLANG_PLUGIN_SENTINEL
     if any(
         name == "xpool.integrations.sglang" or name.startswith("xpool.integrations.sglang.") for name in sys.modules
@@ -50,12 +53,26 @@ def run_ffn_reference_child(
             join=True,
         )
     connection.send(ffn_protocol.FfnReferenceCompleted(case_count=len(job.cases)))
+    progress.event("process", "complete", case_count=len(job.cases))
 
 
 def run_ffn_reference_rank(
     tensor_parallel_rank: int,
     job: ffn_protocol.FfnReferenceJob,
     rendezvous_uri: str,
+) -> None:
+    """Retain diagnostics across rank failure and cancellation without changing collective timeouts."""
+
+    progress = diagnostics.ReferenceDiagnostics(job.workdir, tensor_parallel_rank, job.diagnostics)
+    with progress.watchdog(), progress.phase("rank", rendezvous_uri=rendezvous_uri):
+        evaluate_ffn_reference_rank(tensor_parallel_rank, job, rendezvous_uri, progress)
+
+
+def evaluate_ffn_reference_rank(
+    tensor_parallel_rank: int,
+    job: ffn_protocol.FfnReferenceJob,
+    rendezvous_uri: str,
+    progress: diagnostics.ReferenceDiagnostics,
 ) -> None:
     """Load one TP shard, execute every case, and release SGLang state."""
 
@@ -65,6 +82,7 @@ def run_ffn_reference_rank(
     ):
         raise RuntimeError("xpool SGLang integration was imported before FFN reference isolation")
 
+    progress.event("sglang_imports", "start")
     import gc
 
     import sglang.srt.configs.device_config
@@ -82,7 +100,14 @@ def run_ffn_reference_rank(
     import torch
     import torch.distributed
 
-    torch.cuda.set_device(tensor_parallel_rank)
+    progress.event("sglang_imports", "complete")
+    with progress.phase("cuda_device_binding", device=tensor_parallel_rank):
+        torch.cuda.set_device(tensor_parallel_rank)
+    if job.diagnostics:
+        (job.workdir / f"rank-{tensor_parallel_rank}-environment.json").write_text(
+            json.dumps(diagnostics.cuda_gemm_environment(), indent=2) + "\n", encoding="utf-8"
+        )
+    progress.event("server_args", "start", dtype=job.dtype, moe_runner_backend=job.moe_runner_backend)
     server_args = typing.cast(typing.Any, sglang.srt.server_args.ServerArgs)(
         model_path=str(job.model_path),
         skip_tokenizer_init=True,
@@ -106,7 +131,10 @@ def run_ffn_reference_rank(
     )
     sglang.srt.runtime_context.publish(server_args, role="scheduler")
     sglang.srt.layers.moe.utils.initialize_moe_config()
-    model_config = sglang.srt.configs.model_config.ModelConfig.from_server_args(server_args)
+    progress.event("server_args", "complete")
+    with progress.phase("model_config"):
+        model_config = sglang.srt.configs.model_config.ModelConfig.from_server_args(server_args)
+    progress.event("model_config", "resolved", hidden_size=model_config.hidden_size, dtype=str(model_config.dtype))
     sglang.srt.distributed.set_custom_all_reduce(False)
 
     # The reference uses SGLang's real model loader and TP groups while keeping
@@ -115,6 +143,9 @@ def run_ffn_reference_rank(
     failure: BaseException | None = None
     vllm_parallel_state_patched = False
     try:
+        progress.event(
+            "distributed_environment", "start", timeout_seconds=sglang.srt.runtime_context.get_parallel().dist_timeout
+        )
         sglang.srt.distributed.init_distributed_environment(
             world_size=job.tensor_parallel_size,
             rank=tensor_parallel_rank,
@@ -124,6 +155,8 @@ def run_ffn_reference_rank(
             timeout=sglang.srt.runtime_context.get_parallel().dist_timeout,
             moe_a2a_backend="none",
         )
+        progress.event("distributed_environment", "complete")
+        progress.event("model_parallel_groups", "start")
         sglang.srt.distributed.initialize_model_parallel(
             tensor_model_parallel_size=job.tensor_parallel_size,
             expert_model_parallel_size=1,
@@ -143,10 +176,13 @@ def run_ffn_reference_rank(
             raise RuntimeError(
                 f"FFN reference parallel group widths {group_widths} do not match {expected_group_widths}"
             )
+        progress.event("model_parallel_groups", "complete", widths=group_widths)
+        progress.event("dp_attention", "start")
         sglang.srt.layers.dp_attention.initialize_dp_attention(
             server_args=server_args,
             model_config=model_config,
         )
+        progress.event("dp_attention", "complete")
         load_config = sglang.srt.configs.load_config.LoadConfig(
             load_format=sglang.srt.runtime_context.get_model().load_format,
             download_dir=sglang.srt.runtime_context.get_model().download_dir,
@@ -155,11 +191,12 @@ def run_ffn_reference_rank(
         )
         sglang.srt.distributed.parallel_state.monkey_patch_vllm_parallel_state()
         vllm_parallel_state_patched = True
-        model = sglang.srt.model_loader.get_model(
-            model_config=model_config,
-            load_config=load_config,
-            device_config=sglang.srt.configs.device_config.DeviceConfig("cuda", tensor_parallel_rank),
-        )
+        with progress.phase("model_loader"):
+            model = sglang.srt.model_loader.get_model(
+                model_config=model_config,
+                load_config=load_config,
+                device_config=sglang.srt.configs.device_config.DeviceConfig("cuda", tensor_parallel_rank),
+            )
         sglang.srt.distributed.parallel_state.monkey_patch_vllm_parallel_state(reverse=True)
         vllm_parallel_state_patched = False
         if type(model).__name__ not in SUPPORTED_MODEL_CLASSES:
@@ -174,26 +211,46 @@ def run_ffn_reference_rank(
             layer = typed_model.model.layers[case.layer_id]
             if isinstance(layer, sglang.srt.layers.utils.PPMissingLayer):
                 raise RuntimeError(f"FFN reference TP rank {tensor_parallel_rank} does not own layer {case.layer_id}")
-            execute_ffn_reference_case(
-                hidden_size=model_config.hidden_size,
-                model_dtype=model_config.dtype,
-                mlp=layer.mlp,
-                case=case,
-                persist_result=tensor_parallel_rank == 0,
-            )
-            torch.distributed.barrier()
+            with progress.phase("ffn_case", case_id=case.case_id, layer_id=case.layer_id):
+                execute_ffn_reference_case(
+                    hidden_size=model_config.hidden_size,
+                    model_dtype=model_config.dtype,
+                    mlp=layer.mlp,
+                    case=case,
+                    persist_result=tensor_parallel_rank == 0,
+                    progress=progress,
+                )
+            with progress.phase("barrier", case_id=case.case_id):
+                torch.distributed.barrier()
+        # Complete the entire normative FFN batch before diagnostic GEMMs can
+        # warm allocator/BLAS caches or initialize profiler state.
+        if job.diagnostics and tensor_parallel_rank == 0:
+            import safetensors.torch
+
+            for case in job.cases:
+                saved = safetensors.torch.load_file(case.output_path)
+                router = getattr(typed_model.model.layers[case.layer_id].mlp, "router", None)
+                if router is not None and "router_logits" in saved:
+                    hidden_states = safetensors.torch.load_file(case.input_path)["hidden_states"]
+                    with progress.phase("router_gemm_probe", case_id=case.case_id):
+                        write_router_projection_evidence(router, hidden_states, saved["router_logits"], case)
     except BaseException as error:
         failure = error
     finally:
+        progress.event("cleanup", "start")
         if vllm_parallel_state_patched:
             sglang.srt.distributed.parallel_state.monkey_patch_vllm_parallel_state(reverse=True)
         model = None
         try:
-            sglang.srt.distributed.destroy_model_parallel()
-            sglang.srt.distributed.destroy_distributed_environment()
+            with progress.phase("destroy_model_parallel"):
+                sglang.srt.distributed.destroy_model_parallel()
+            with progress.phase("destroy_distributed_environment"):
+                sglang.srt.distributed.destroy_distributed_environment()
             gc.collect()
             torch.cuda.empty_cache()
+            progress.event("cleanup", "complete")
         except BaseException as cleanup_error:
+            progress.event("cleanup", "error", error=repr(cleanup_error))
             if failure is None:
                 raise
             failure.add_note(f"FFN reference cleanup also failed: {cleanup_error!r}")
@@ -208,6 +265,7 @@ def execute_ffn_reference_case(
     mlp: torch.nn.Module,
     case: ffn_protocol.FfnReferenceCaseSpec,
     persist_result: bool,
+    progress: diagnostics.ReferenceDiagnostics | None = None,
 ) -> None:
     """Execute one TP FFN case and persist its rank-zero result."""
 
@@ -220,6 +278,8 @@ def execute_ffn_reference_case(
     if set(tensors) != {"hidden_states"}:
         raise RuntimeError(f"FFN reference input has invalid tensor keys: {sorted(tensors)}")
     hidden_states = tensors["hidden_states"]
+    if progress is not None and progress.enabled:
+        progress.event("ffn_input", "loaded", case_id=case.case_id, geometry=diagnostics.tensor_geometry(hidden_states))
     if hidden_states.ndim != 2 or hidden_states.shape[1] != hidden_size:
         raise RuntimeError(
             f"FFN reference input shape {tuple(hidden_states.shape)} does not match hidden size {hidden_size}"
@@ -371,3 +431,58 @@ def execute_ffn_reference_case(
 
     with case.output_path.open("xb") as output_file:
         output_file.write(safetensors.torch.save(output_tensors))
+
+
+def write_router_projection_evidence(
+    router: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    reference_logits: torch.Tensor,
+    case: ffn_protocol.FfnReferenceCaseSpec,
+) -> None:
+    """Profile the installed Router and both Torch GEMMs after saving the unmodified FFN result."""
+
+    import safetensors.torch
+    from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
+
+    # Router implementations are unrelated third-party modules; require real
+    # unquantized weight/bias tensors before attempting this optional probe.
+    weight = getattr(router, "weight", None)
+    bias = getattr(router, "bias", None)
+    if not isinstance(weight, torch.Tensor) or not isinstance(bias, torch.Tensor):
+        return
+    with torch.inference_mode():
+        hidden = hidden_states.to(device=weight.device)
+        destination = torch.empty_like(reference_logits, device=weight.device)
+
+        def original_router() -> torch.Tensor:
+            result = router(hidden)
+            return result[0] if isinstance(result, tuple) else result
+
+        outputs = diagnostics.profile_projection(
+            case.output_path.parent / "router-projection.trace.json",
+            {
+                "sglang_router": original_router,
+                "linear": lambda: torch.nn.functional.linear(hidden, weight, bias),
+                "addmm_out": lambda: torch.addmm(bias, hidden, weight.t(), out=destination),
+            },
+        )
+        tensors = {name: value.detach().cpu().contiguous() for name, value in outputs.items()}
+        tensors["reference_logits"] = reference_logits
+        safetensors.torch.save_file(tensors, case.output_path.parent / "router-projection.safetensors")
+        metadata = {
+            "case_id": case.case_id,
+            "input": diagnostics.tensor_geometry(hidden),
+            "weight": diagnostics.tensor_geometry(weight),
+            "bias": diagnostics.tensor_geometry(bias),
+            "output": diagnostics.tensor_geometry(destination),
+            "bf16_gemm_backend": get_bf16_gemm_backend().value,
+            "implementation": diagnostics.module_implementation(router),
+            "comparisons": {
+                name: diagnostics.tensor_difference(reference_logits, value)
+                for name, value in tensors.items()
+                if name != "reference_logits"
+            },
+        }
+        (case.output_path.parent / "router-projection.json").write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        )

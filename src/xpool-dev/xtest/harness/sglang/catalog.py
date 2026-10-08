@@ -116,6 +116,7 @@ class E2eFfnNumericalCase(BaseModel):
     # SGLang 0.5.20 ServerArgs values; the Python package is named triton_kernels.
     reference_moe_runner_backend: Literal["auto", "triton_kernel"] = "auto"
     reference_dtype: Literal["auto", "bfloat16"] = "auto"
+    reference_diagnostics: bool = False
     estimated_duration_seconds: float = Field(gt=0)
     timeout_seconds: float = Field(gt=0)
 

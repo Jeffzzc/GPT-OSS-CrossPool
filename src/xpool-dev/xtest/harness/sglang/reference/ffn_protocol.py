@@ -26,6 +26,7 @@ class FfnReferenceJob:
     cases: tuple[FfnReferenceCaseSpec, ...]
     moe_runner_backend: str = "auto"
     dtype: str = "auto"
+    diagnostics: bool = False
 
 
 @dataclass(frozen=True, slots=True)

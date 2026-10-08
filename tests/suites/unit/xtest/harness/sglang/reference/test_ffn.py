@@ -186,6 +186,7 @@ def test_runner_preserves_order_normalizes_inputs_and_is_single_use(
     job = state["job"]
     assert job is not None
     assert job.tensor_parallel_size == 2
+    assert job.diagnostics is False
     assert state["closed"] is True
     assert state["terminated"] is False
     timeouts = state["timeouts"]
@@ -228,6 +229,7 @@ def test_runner_projects_moe_routing_evidence(
         cases=(make_case(),),
         moe_runner_backend=moe_runner_backend,
         dtype="bfloat16",
+        diagnostics=True,
     )[0]
 
     assert result.routing is not None
@@ -239,6 +241,7 @@ def test_runner_projects_moe_routing_evidence(
     assert state["job"] is not None
     assert state["job"].moe_runner_backend == moe_runner_backend
     assert state["job"].dtype == "bfloat16"
+    assert state["job"].diagnostics is True
 
 
 def test_runner_terminates_failed_child_without_returning_partial_results(

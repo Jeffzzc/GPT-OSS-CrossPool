@@ -57,6 +57,9 @@ The model suite covers layers `(0, 12, 23)` and rows `(1, 31, 32, 33, 4096)`.
 Keep the existing model-owned output and routing tolerances. The additional
 checkpoint Router test requires exact BF16 logits, TopK IDs and BF16-rounded
 weights and writes `gpt-oss-router.safetensors` before parity assertions.
+Its [diagnostic contract](router-parity.md) records GEMM environments and
+capacity probes separately and reserves cleanup time within the explicit
+1800-second test deadline. Numerical acceptance remains unchanged.
 
 Diagnose failures in this order: checkpoint decode, local TP projection,
 Router logits, TopK, W13 accumulator/bias, clamped activation, W2/bias,

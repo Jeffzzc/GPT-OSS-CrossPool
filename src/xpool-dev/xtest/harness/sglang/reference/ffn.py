@@ -60,6 +60,7 @@ class SglangFfnReferenceRunner:
         cases: Sequence[SglangFfnReferenceCase],
         moe_runner_backend: str = "auto",
         dtype: str = "auto",
+        diagnostics: bool = False,
     ) -> tuple[SglangFfnReferenceResult, ...]:
         """Load one raw model, evaluate every case, and release the child.
 
@@ -69,6 +70,7 @@ class SglangFfnReferenceRunner:
             cases: Nonempty ordered FFN evaluation batch.
             moe_runner_backend: Pinned SGLang 0.5.20 ServerArgs value, ``auto``
                 or ``triton_kernel``; passed unchanged to the isolated job.
+            diagnostics: Persist rank-local phase logs, stack samples and Router GEMM probes.
 
         Returns:
             CPU results in the same order as ``cases``.
@@ -137,6 +139,7 @@ class SglangFfnReferenceRunner:
                 cases=tuple(case_specs),
                 moe_runner_backend=moe_runner_backend,
                 dtype=dtype,
+                diagnostics=diagnostics,
             ),
             log_path=self.workdir / "child.log",
         )
