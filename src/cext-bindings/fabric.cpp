@@ -11,7 +11,6 @@
 #include "bindings.hpp"
 #include <xpool/fabric/runtime.hpp>
 #include <xpool/ffn.hpp>
-#include <xpool/ffnagent/router.hpp>
 #include <xpool/ffnagent/runtime.hpp>
 #include <xpool/runtime.hpp>
 
@@ -40,11 +39,6 @@ namespace xpool::bindings {
 void bind_fabric(py::module_ &module) {
   auto fabric = module.def_submodule("fabric", "Native NVSHMEM Fabric control and lifecycle functions.");
   auto ffnagent = module.def_submodule("ffnagent", "Native FfnAgent execution lifecycle functions.");
-  ffnagent.attr("BIASED_ROUTER_GEMM_WORKSPACE_BYTES") = xpool::ffnagent::kBiasedRouterGemmWorkspaceBytes;
-  ffnagent.attr("BIASED_ROUTER_GEMM_ALIGNMENT_BYTES") = xpool::ffnagent::kBiasedRouterGemmAlignmentBytes;
-  ffnagent.def("biased_router_gemm", &xpool::ffnagent::biased_router_gemm, py::arg("hidden_states"), py::arg("weight"),
-              py::arg("bias"), py::arg("logits"), py::arg("workspace"),
-              "Biased BF16 GEMM with caller-owned, Lane-relocatable cuBLASLt scratch.");
   fabric.attr("UID_HEX_LENGTH") = xpool::fabric::Uid::encoded_size;
 
   py::class_<xpool::fabric::InstanceLayerProjection>(fabric, "InstanceLayerProjection",

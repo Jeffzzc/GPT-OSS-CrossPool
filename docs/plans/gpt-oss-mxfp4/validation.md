@@ -103,7 +103,7 @@ FFN numerical or Graph replay verdict.
 Follow the [build requirements](../../../README.md#requirements),
 [installation instructions](../../tutorials/quick-start.md) and
 [test environment conventions](../../../tests/README.md#commands).
-Build the native module and generated stubs at ABI 86 before type checks or
+Build the native module and generated stubs at ABI 85 before type checks or
 tests. Recompute memory calibration because ABI, spec identities, workspaces
 and the packed calibration corpus changed. The corpus includes fitted C4
 and held-out H0 packed worlds. Resource qualification must require zero
@@ -145,32 +145,6 @@ using `write-design`; retain the scoped plan until confirmed cleanup.
 Paths are relative to the repository root. Existing model-family mathematics
 and third-party sources remain owned by their original implementations.
 
-The Router repair adds `src/cext-include/xpool/ffnagent/router.hpp` and
-`src/cext/ffnagent/router.cpp` for the caller-scratch Lt operator, links
-`CUDA::cublasLt` in `src/cext/CMakeLists.txt`, and binds the operator/constants
-in `src/cext-bindings/fabric.cpp`. `tests/suites/cext/ffnagent/router_test.cu`
-checks real cuBLASLt capture schemas, weight/bias rebinding, input alignment
-and independent concurrent Lane scratch. The adapter/layout/operator tests
-below additionally require replay allocation and per-Lane memory ledgers.
-`src/xpool/runtime/ffnagent/agent.py` retains its process policy and documents
-why implicit BLAS scratch cannot be used for Lane capture. The opt-in
-`src/xpool-dev/xtest/harness/sglang/reference/router_probe.py` records the
-explicit scratch span and budget alongside existing raw tensors/kernel traces.
-
-For this repair, run the native Router/parameterization/ABI checks after
-rebuilding, then the focused harness, workspace and Router checks, and finally
-the exact Router and complete model suite. Build and formatting/type tools
-require the managed Linux toolchain; a Windows syntax-only inspection does
-not supply native or qualification evidence.
-
-```bash
-uv run xtest run --suite cext --strict-requirements
-uv run pytest tests/suites/unit/xtest/harness/sglang/reference tests/suites/unit/runtime/ffnagent/models/gpt_oss tests/suites/unit/runtime/ffnagent/test_execution.py tests/suites/unit/runtime/ffnagent/test_device_memory.py -v
-uv run pytest tests/suites/integration/runtime/ffnagent/models/gpt_oss/test_router.py -v --strict-requirements
-uv run xtest run --integration=sglang --suite openai/gpt-oss-20b -k test_checkpoint_router_projection_and_topk --strict-requirements
-uv run xtest run --integration=sglang --suite openai/gpt-oss-20b --strict-requirements
-```
-
 | File | Reason |
 | --- | --- |
 | `docs/plans/gpt-oss-mxfp4/README.md` | Scoped target design and dependency boundary. |
@@ -193,8 +167,8 @@ uv run xtest run --integration=sglang --suite openai/gpt-oss-20b --strict-requir
 | `src/cext/ffnagent/projection.cpp` | Primary/Control and target schema/resource discovery validation. |
 | `src/cext/ffnagent/runtime.cu` | Populate, validate and rebind every additional address in Lane Graphs. |
 | `src/cext-bindings/fabric.cpp` | Bind the new native projection resources with backward-compatible defaults. |
-| `src/cext-include/xpool/abi.hpp` | Increment native ABI to 86, invalidating calibration before explicit Router scratch is used. |
-| `src/xpool/cext.py` | Require ABI 86 in the Python loader. |
+| `src/cext-include/xpool/abi.hpp` | Increment native ABI to 85. |
+| `src/xpool/cext.py` | Require ABI 85 in the Python loader. |
 | `src/xpool-dev/xkit/serving/sglang/launch.py` | Explicit BF16 and full-storage SWA launch policy. |
 | `src/xpool-dev/xkit/serving/sglang/server.py` | Preserve those policies in SGLang CLI arguments. |
 | `src/xpool-dev/xtest/harness/sglang/catalog.py` | Typed numerical reference and serving launch policies. |

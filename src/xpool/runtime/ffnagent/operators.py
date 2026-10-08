@@ -13,7 +13,6 @@ import triton
 from triton import language
 
 from xpool.ffn import ActivationKind
-from xpool.native import ffnagent
 from xpool.runtime.ffnagent import execution, weights
 from xpool.utils import align_up
 
@@ -100,15 +99,12 @@ def compute_biased_router_logits(
     hidden_states: torch.Tensor,
     router_weights: weights.MoeRouterWeights,
     logits: torch.Tensor,
-    workspace: torch.Tensor,
 ) -> None:
     """Match the pinned BF16 Router projection into caller-owned logits.
 
     The reference uses FlashInfer TinyGemm for small SM90/Blackwell batches
     and a biased linear GEMM otherwise. Bias is accumulated before BF16 output
     rounding; adding bias to an already rounded unbiased GEMM is different.
-    SM80 uses explicit caller-owned Lt scratch, retaining the reference's
-    default heuristic budget independently of the process zero-workspace policy.
     """
 
     from sglang.srt.utils import is_flashinfer_available
@@ -128,11 +124,6 @@ def compute_biased_router_logits(
             return
     if router_weights.projection_bias is None:
         raise ValueError("biased Router projection requires ordinary projection bias")
-    if capability == (8, 0):
-        ffnagent.biased_router_gemm(
-            hidden_states, router_weights.weight, router_weights.projection_bias, logits, workspace
-        )
-        return
     torch.addmm(router_weights.projection_bias, hidden_states, router_weights.weight.t(), out=logits)
 
 

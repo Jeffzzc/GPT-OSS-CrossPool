@@ -133,82 +133,23 @@ requires an accepted operator/graph design. Neither alternative is implemented
 or accepted by this diagnostic change. Expert MXFP4 execution, TP slicing,
 W13/W2 and serving Graph resource schemas remain outside its scope.
 
-## Controlled result and production repair
+## Candidate repair after the experiment
 
-Controlled A100 experiments established workspace policy as the cause of the
-nine discrepancies: unset matched all 15 original-SGLang samples exactly;
-`:0:0` matched six and reproduced the nine small-batch failures. Actual-row
-and capacity execution, eager and Graph replay, were identical under each
-policy. Expert sets remained equal. The maxima below are over rows 31/32/33,
-not claims about each individual row count or validation of the repair.
+If workspace alone explains the discrepancy, keep the existing Router bias,
+TopK and Expert mathematics. A production repair must supply the required Lt
+scratch with explicit ownership, memory accounting and Lane address relocation.
+Removing the process policy, enlarging it, or separating the global Lt pool
+does not by itself prove those properties: captured handles can retain scratch
+addresses outside the declared Lane workspace, and concurrent Lanes must not
+write the same scratch allocation.
 
-| Layer | Affected rows | Maximum BF16 logit error | Maximum routing weight error |
-| --- | --- | --- | --- |
-| 0 | 31, 32, 33 | 0.015625 | 0.005859375 |
-| 12 | 31, 32, 33 | 0.00390625 | 0.001953125 |
-| 23 | 31, 32, 33 | 0.00390625 | 0.001953125 |
-
-Torch caches environment-derived workspace limits process-wide; handles are
-pooled per host thread/device and implicit scratch is keyed by handle/stream,
-not by Executor Lane. Standard `addmm(out=...)` supplies an output destination,
-not caller-owned Lt scratch. Enlarging that implicit pool cannot establish Lane
-ownership or relocation. A custom GEMM would additionally need experimental
-proof of Split-K rounding. The scoped repair therefore uses the native biased
-GEMM in the [target delta](README.md#sm80-router-gemm-workspace), preserving
-the zero process policy and the original reference.
-
-The explicit operator uses BF16 A/B/C/D, FP32 compute and scalar types, alpha=1,
-beta=0, column-major views `W.T @ X.T`, and the bias epilogue. It reproduces
-Torch's reduction mask, alignment preferences and first heuristic result with
-the pinned default 1 MiB Lt limit. Algorithm identifiers are library/version
-dependent; retained kernel traces, rather than a hardcoded ID, validate the
-selected GEMM and Split-K reduction. Weight/bias discovery must cover both.
-
-The enclosing Router workspace and its scratch offset are 256-byte aligned.
-The captured Torch input is also normally 256-byte aligned, whereas the
-Fabric payload guarantees only 16 bytes. Query the selected algorithm's
-minimum B alignment and fail closed if it exceeds the Fabric guarantee;
-do not silently select another algorithm. The native Lane test deliberately
-uses input addresses aligned to 16 but not 256 bytes after relocation.
-Scratch contributes one MiB plus alignment padding per Router-owner capture
-and one MiB plus padding to the maximum per-Lane workspace. TP followers acquire
-no Router scratch. It shares the existing workspace lifetime and relocation
-range, so no new layer resource field or pointer lifetime is introduced.
-The native test poisons capture storage after installation, alternates layer
-weight/bias addresses from a device update node, and launches two independently
-relocated Lane Graphs before waiting for either. Synthetic Python tests check
-changed-input replay, exact routes and absence of replay allocations.
-
-The exact model test asserts logits, IDs and weights against unchanged SGLang
-for every eager/Graph/capacity variant in both policy children, after retaining
-all evidence. The original FFN and serving qualification remain required.
-Rebuild generated stubs, recalibrate memory and run these tests on SM80 before
-claiming the repair is qualified. No threshold or reference-policy change is
-part of this repair. If a library version selects a different algorithm or its
-captured parameters escape declared resources, preserve the failure and its
-trace rather than falling back to unowned scratch.
-
-## Router repair file scope
-
-| File | Target function or contract |
-| --- | --- |
-| `src/cext-include/xpool/ffnagent/router.hpp` | Declare `biased_router_gemm`, the 1 MiB budget and 256-byte alignment/lifetime contract. |
-| `src/cext/ffnagent/router.cpp` | Implement tensor validation, Torch-compatible Lt descriptors/heuristic, explicit scratch and Fabric input-alignment admission. |
-| `src/cext/CMakeLists.txt` | Link `CUDA::cublasLt` through the existing native core. |
-| `src/cext-bindings/fabric.cpp` | Bind the operator and workspace constants under the existing `native.ffnagent` module. |
-| `src/xpool/runtime/ffnagent/operators.py` | Select explicit-scratch GEMM on SM80 inside `compute_biased_router_logits`; preserve TinyGemm and other dispatch. |
-| `src/xpool/runtime/ffnagent/models/gpt_oss.py` | Derive logits/TopK/scratch spans and pass their disjoint views through `compute_routed_topk`. |
-| `src/xpool/runtime/ffnagent/execution.py` | Align the additive-bias Router region in `moe_workspace_layout`; existing capture/Lane ledgers consume its full extent. |
-| `src/xpool/runtime/ffnagent/agent.py` | Document the retained zero-workspace process policy at initialization. |
-| `src/cext-include/xpool/abi.hpp` | Advance native identity to 86. |
-| `src/xpool/cext.py` | Require ABI 86 and reject stale binaries. |
-| `tests/suites/cext/abi_test.cpp` | Require the revised identity. |
-| `tests/suites/cext/ffnagent/router_test.cu` | Exercise actual Lt capture schemas, device weight/bias rebinding, 16-byte Lane input and independent relocated scratch. |
-| `tests/suites/integration/runtime/ffnagent/models/gpt_oss/test_router.py` | Supply scratch, check repeated changed-input eager/replay/capacity results, peak allocations and invalid scratch rejection. |
-| `tests/suites/unit/runtime/ffnagent/models/gpt_oss/test_architecture.py` | Check per-capacity workspace extent/alignment and capture accounting. |
-| `tests/suites/unit/runtime/ffnagent/test_device_memory.py` | Prove scratch enters every Router-owner capture and Lane ledger, preserves allocation counts and leaves followers unchanged. |
-| `src/xpool-dev/xtest/harness/sglang/reference/router_probe.py` | Record explicit scratch geometry/budget in existing opt-in evidence. |
-| `tests/suites/models/openai/gpt-oss-20b/test_sglang_model_qualification.py` | Require exact logits/IDs/weights for all variants under both fresh workspace policies against unchanged SGLang. |
-| `docs/plans/gpt-oss-mxfp4/README.md` | Own the explicit-workspace target delta and ownership decisions. |
-| `docs/plans/gpt-oss-mxfp4/router-parity.md` | Own causal evidence, numerical boundaries and the repair scope. |
-| `docs/plans/gpt-oss-mxfp4/validation.md` | Require rebuild, calibration, focused checks and complete qualification. |
+The scoped candidate is a caller-workspace biased GEMM at the existing operator
+seam, with scratch included in the Router workspace derivation and the existing
+Lane workspace projection. It must reproduce the reference's admitted GEMM
+geometry, descriptors, reduction policy and effective workspace limit, and pass
+Primary/Control discovery, per-layer rebinding, concurrent-Lane resource tests,
+memory calibration and numerical/serving qualification. This is a candidate,
+not an accepted core implementation or evidence that a new native API is
+necessarily required. If shape still changes BF16 results after workspace is
+matched, resolving actual-row-count projection is a separate Graph design
+decision; this experiment does not authorize a changed reference or tolerance.

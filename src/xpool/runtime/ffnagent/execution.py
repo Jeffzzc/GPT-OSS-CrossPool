@@ -10,7 +10,6 @@ import torch
 
 from xpool import ffn
 from xpool.fabric import InstanceFfnProfile
-from xpool.native.ffnagent import BIASED_ROUTER_GEMM_ALIGNMENT_BYTES
 from xpool.runtime.ffnagent import architecture, weights
 from xpool.utils import align_up
 
@@ -249,16 +248,8 @@ def moe_workspace_layout(
 
     offsets = []
     cursor = 0
-    for index, (dtype, shape) in enumerate(region_specs):
-        # Biased Router logits and Lt scratch match standalone Torch alignment.
-        # Capture and Lane bases are cudaMalloc-aligned, preserving alignment
-        # when native installation relocates interior workspace pointers.
-        alignment = (
-            BIASED_ROUTER_GEMM_ALIGNMENT_BYTES
-            if index == 6 and signature.router is not None and signature.router.projection_bias_present
-            else OPERATOR_ALIGNMENT_BYTES
-        )
-        cursor = align_up(cursor, alignment)
+    for dtype, shape in region_specs:
+        cursor = align_up(cursor, OPERATOR_ALIGNMENT_BYTES)
         offsets.append(cursor)
         cursor += math.prod(shape) * dtype.itemsize
     return tuple(region_specs), tuple(offsets), cursor

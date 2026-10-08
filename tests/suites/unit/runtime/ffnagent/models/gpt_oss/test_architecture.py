@@ -8,7 +8,6 @@ import pytest
 import torch
 
 from xpool import ffn
-from xpool.native import ffnagent
 from xpool.runtime.ffnagent import architecture, execution
 from xpool.runtime.ffnagent.models.gpt_oss import GptOssAdapter
 from xtest.harness.support.config import TEST_MODEL_ID
@@ -107,54 +106,3 @@ def test_execution_identity_and_workspace_account_for_fp32_activation_epilogue()
     assert execution.control_capture_probe_storage_bytes(signature) == (8192, 4096, 512, 256, 512, 256)
     with pytest.raises(ValueError, match="clamped"):
         replace(signature, activation=ffn.ActivationKind.SILU)
-
-
-@pytest.mark.parametrize("rows", (1, 31, 32, 33, 64, 4096))
-def test_router_scratch_is_aligned_and_accounted_in_capture_workspace(rows: int) -> None:
-    workspace_bytes = GptOssAdapter.router_workspace_bytes(
-        payload_dtype=torch.bfloat16,
-        payload_row_capacity=rows,
-        hidden_size=2880,
-        routed_expert_count=32,
-        routed_topk=4,
-    )
-    logits_end, topk_end, scratch_offset = GptOssAdapter.router_workspace_layout(payload_row_capacity=rows)
-    assert logits_end == rows * 32 * 2
-    assert logits_end < topk_end <= scratch_offset
-    assert scratch_offset % 256 == 0
-    assert workspace_bytes - scratch_offset == 1024 * 1024 == ffnagent.BIASED_ROUTER_GEMM_WORKSPACE_BYTES
-    router = execution.MoeRouterExecutionSignature(
-        compute_routed_topk=GptOssAdapter.compute_routed_topk,
-        router_weight_dtype=torch.bfloat16,
-        routed_expert_count=32,
-        router_workspace_bytes=workspace_bytes,
-        correction_bias_present=False,
-        projection_bias_present=True,
-        renormalize=True,
-    )
-    signature = execution.MoeFfnExecutionSignature(
-        payload_dtype=torch.bfloat16,
-        payload_row_capacity=rows,
-        hidden_size=2880,
-        local_intermediate_size=1440,
-        expert_count=32,
-        effective_topk=4,
-        activation=ffn.ActivationKind.CLAMPED_SWIGLU,
-        activation_alpha=1.702,
-        activation_clamp_limit=7.0,
-        expert_weight_kind=ffn.ExpertWeightKind.MXFP4,
-        routed_scaling_factor=1.0,
-        router=router,
-    )
-    for block_size in execution.QUALIFIED_MOE_BLOCK_SIZE_M_VALUES:
-        regions, offsets, extent = execution.moe_workspace_layout(signature, block_size_m=block_size)
-        assert regions[6] == (torch.uint8, (workspace_bytes,))
-        assert offsets[6] % 256 == 0
-        assert (offsets[6] + scratch_offset) % 256 == 0
-        assert offsets[6] + workspace_bytes <= offsets[7] < extent
-    without_scratch = replace(signature, router=replace(router, router_workspace_bytes=scratch_offset))
-    assert (
-        execution.compute_workspace_bytes(signature) - execution.compute_workspace_bytes(without_scratch) == 1024 * 1024
-    )
-    assert execution.graph_capture_capacity_storage_bytes(signature)[3] == execution.compute_workspace_bytes(signature)
-    assert signature != without_scratch
