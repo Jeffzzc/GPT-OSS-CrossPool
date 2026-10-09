@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from time import monotonic
 
 import torch
@@ -32,10 +31,10 @@ class FfnAgent(Agent):
     def __init__(self, *, device: int) -> None:
         """Initialize native FFN role state and daemon ownership.
 
-        CUDA must not already be initialized. Construction installs the cuBLAS
-        workspace policy, initializes the native FfnAgent role, validates any
-        selected calibration profile against the local device, and loads every
-        configured model specification.
+        CUDA must not already be initialized. Construction initializes the
+        native FfnAgent role, validates any selected calibration profile against
+        the local device, and loads every configured model specification. The
+        inherited cuBLAS workspace configuration is preserved.
 
         Raises:
             AgentError: If CUDA is already initialized or calibration does not
@@ -43,8 +42,7 @@ class FfnAgent(Agent):
         """
 
         if torch.cuda.is_initialized():
-            raise AgentError("FfnAgent CUDA initialized before installing its cuBLAS workspace policy")
-        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":0:0"
+            raise AgentError("FfnAgent CUDA initialized before agent construction")
         super().__init__(device=device, runtime_role=RuntimeRole.FFNAGENT)
         ensure_supported_cuda_allocator()
         config = get_global_config()

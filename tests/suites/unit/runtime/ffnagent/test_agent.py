@@ -20,24 +20,35 @@ from xtest.harness.support.config import install_test_config, reset_global_confi
 pytestmark = pytest.mark.usefixtures(reset_global_config.__name__)
 
 
-def test_ffnagent_rejects_cuda_initialized_before_workspace_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ffnagent_rejects_cuda_initialized_before_construction(monkeypatch: pytest.MonkeyPatch) -> None:
     install_test_config(synthetic_config())
     monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        xpool.runtime.ffnagent.agent.Agent,
+        "__init__",
+        lambda self, **kwargs: pytest.fail("bootstrap must not run after CUDA initialization"),
+    )
 
-    with pytest.raises(AgentError, match="CUDA initialized before"):
+    with pytest.raises(AgentError, match="CUDA initialized before agent construction"):
         FfnAgent(device=1)
 
 
-def test_ffnagent_installs_zero_workspace_policy_before_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("workspace_policy", [None, ":0:0", ":4096:8"])
+def test_ffnagent_preserves_workspace_policy_through_bootstrap(
+    monkeypatch: pytest.MonkeyPatch, workspace_policy: str | None
+) -> None:
     install_test_config(synthetic_config())
-    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    if workspace_policy is None:
+        monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    else:
+        monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", workspace_policy)
     monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (1, 2))
 
     def bootstrap_agent(self: Agent, **kwargs: object) -> None:
-        assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":0:0"
+        assert os.environ.get("CUBLAS_WORKSPACE_CONFIG") == workspace_policy
         self.proc_id = ProcUniqId.current()
         self.local_rank = 0
         self.device = 1
@@ -50,7 +61,7 @@ def test_ffnagent_installs_zero_workspace_policy_before_bootstrap(monkeypatch: p
 
     FfnAgent(device=1)
 
-    assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":0:0"
+    assert os.environ.get("CUBLAS_WORKSPACE_CONFIG") == workspace_policy
 
 
 def test_ffnagent_rejects_incompatible_calibration_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
