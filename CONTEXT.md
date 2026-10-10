@@ -51,10 +51,35 @@ conditions, prompt inputs or generation parameters, and arrival process. It is
 distinct from its executions, observed environments and retained measurements.
 _Avoid_: Workload template, benchmark run
 
+**Isolated Benchmark Deployment**:
+A single-model reference for a mixed-model benchmark, retaining the comparison's
+resource geometry and remaining target's workload while removing the peer model.
+_Avoid_: Mixed deployment with zero peer arrival rate
+
+**Catalogue Case ID**:
+The stable identity of one authored test or benchmark scenario, distinct from
+its Model IDs, concrete test rows and executions.
+_Avoid_: Run ID, pytest node ID, Model ID
+
+**Case Family**:
+The scenario category shared by catalogue cases, such as serving or topology,
+distinct from a serving case's owned or client execution mode.
+_Avoid_: Execution mode, test suite
+
 **Benchmark Measurement**:
 Client-observed timing, token progress and request outcomes from one benchmark
 workload execution, independent of their presentation.
 _Avoid_: Benchmark Report, plotted results
+
+**Benchmark Repetition**:
+One requested complete measurement of a Serving Benchmark Case using its
+prepared workload, distinct from its identity, execution attempts and requests.
+_Avoid_: Case ID, Benchmark Attempt
+
+**Benchmark Attempt**:
+One actual execution of a Benchmark Repetition with its own measurements and
+outcome; another attempt does not create another logical repetition.
+_Avoid_: Additional repetition, request retry
 
 **Benchmark Report**:
 An offline presentation derived from retained Benchmark Measurements and their
@@ -70,6 +95,16 @@ _Avoid_: InstanceRankRuntime rank, Instance process
 The complete attention-side rank set backed by the shared AtnAgent Fleet. Each
 Instance covers this World through attention DP groups of attention TP ranks.
 _Avoid_: Attention TP width, per-model rank subset
+
+**FfnAgent Fleet**:
+The complete set of FfnAgents available for generation-scoped FFN placement,
+distinct from the group selected to execute one layer.
+_Avoid_: FFN TP group
+
+**FFN Execution Group**:
+The ordered FfnAgent participants assigned to one model layer's tensor-parallel
+computation. Its width is that layer's FFN TP width, not the Fleet size.
+_Avoid_: FfnAgent Fleet, model replica
 
 **Prefill Context Parallelism**:
 The SGLang execution mode that partitions Prefill token rows among attention
@@ -156,8 +191,8 @@ A distinct group capacity adjustment with a fixed target. The daemon authorizes
 the target; the group coordinates safe application and reports its outcome.
 
 **KV Capacity Demand**:
-The Capacity Group leader's persistent latest-state report of the completed
-capacity operation evaluated by scheduling and the absolute bundle capacity
+The Capacity Group leader's persistent latest-state report of the logical
+capacity evaluated by scheduling and the absolute bundle capacity
 required by one unresolved authoritative admission-failure witness, paired with
 that witness's scheduler-local SLO deadline. It is state, not a consumed pressure
 event.

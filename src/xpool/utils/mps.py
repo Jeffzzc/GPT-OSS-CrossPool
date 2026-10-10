@@ -18,6 +18,10 @@ from time import monotonic, sleep
 from typing import BinaryIO
 
 import psutil
+import torch
+
+# cuda-bindings exposes this binary module without Python type stubs.
+from cuda.bindings.runtime import cudaError_t  # ty: ignore[unresolved-import]
 
 from xpool.utils.procs import ProcUniqId
 from xpool.utils.sighandler import defer_signal_exceptions
@@ -29,6 +33,7 @@ __all__ = [
     "MpsEndpoint",
     "MpsProbeResult",
     "MpsScope",
+    "is_terminal_device_error",
 ]
 
 MPS_CONTROL_COMMAND = "nvidia-cuda-mps-control"
@@ -36,7 +41,43 @@ MPS_PROBE_LOCK_DIRECTORY = Path("/tmp") / f"xpool-mps-probe-locks-{os.getuid()}"
 MPS_STARTUP_TIMEOUT_S = 30.0
 MPS_CLEANUP_TIMEOUT_S = 300.0
 MPS_TERMINATION_TIMEOUT_S = 30.0
-MPS_SCOPE_DIRECTORY = Path("/tmp/xpool-mps")
+MPS_SCOPE_DIRECTORY = Path("/tmp") / f"xpool-mps-{os.getuid()}"
+
+
+def is_terminal_device_error(error: BaseException) -> bool:
+    """Inspect retained CUDA results that explicitly require process exit.
+
+    Follow the original exception's standard cause/context chain. Torch's
+    native exception translator supplies the numeric result dynamically;
+    Python-constructed exceptions can lack it. Missing metadata, ordinary
+    library errors and nonterminal results supply no terminal-exit evidence.
+
+    This predicate performs no device or MPS query. A terminal local result
+    neither proves server-wide fault containment nor complete Fabric retirement.
+    The calling lifecycle owner decides process-exit and resource policy.
+    """
+
+    terminal_codes = (
+        cudaError_t.cudaErrorContained,
+        cudaError_t.cudaErrorIllegalAddress,
+        cudaError_t.cudaErrorLaunchTimeout,
+        cudaError_t.cudaErrorAssert,
+        cudaError_t.cudaErrorHardwareStackError,
+        cudaError_t.cudaErrorIllegalInstruction,
+        cudaError_t.cudaErrorMisalignedAddress,
+        cudaError_t.cudaErrorInvalidAddressSpace,
+        cudaError_t.cudaErrorInvalidPc,
+        cudaError_t.cudaErrorLaunchFailure,
+        cudaError_t.cudaErrorMpsClientTerminated,
+    )
+    current: BaseException | None = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, torch.AcceleratorError) and getattr(current, "error_code", None) in terminal_codes:
+            return True
+        current = current.__cause__ if current.__cause__ is not None else current.__context__
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +122,7 @@ class MpsEndpoint:
         """Return the per-user address derived from the unordered device set."""
 
         key = hashlib.sha256("\n".join(sorted(self.device_uuids)).encode("ascii")).hexdigest()[:32]
-        return MPS_SCOPE_DIRECTORY / str(os.getuid()) / key
+        return MPS_SCOPE_DIRECTORY / key
 
     @property
     def pipe_directory(self) -> Path:
@@ -346,11 +387,10 @@ class MpsScope:
         if self.cleanup_deadline is not None:
             raise InterruptedError("MPS scope is retiring")
 
-        for directory in (MPS_SCOPE_DIRECTORY, MPS_SCOPE_DIRECTORY / str(os.getuid())):
-            directory.mkdir(mode=0o700, exist_ok=True)
-            facts = directory.lstat()
-            if not stat.S_ISDIR(facts.st_mode) or facts.st_uid != os.getuid() or facts.st_mode & 0o022:
-                raise PermissionError(f"MPS directory has incompatible ownership: {directory}")
+        MPS_SCOPE_DIRECTORY.mkdir(mode=0o700, exist_ok=True)
+        facts = MPS_SCOPE_DIRECTORY.lstat()
+        if not stat.S_ISDIR(facts.st_mode) or facts.st_uid != os.getuid() or facts.st_mode & 0o022:
+            raise PermissionError(f"MPS directory has incompatible ownership: {MPS_SCOPE_DIRECTORY}")
         with defer_signal_exceptions():
             self.endpoint.directory.mkdir(mode=0o700, exist_ok=False)
             facts = self.endpoint.directory.lstat()

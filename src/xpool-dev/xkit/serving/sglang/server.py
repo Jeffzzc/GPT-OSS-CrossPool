@@ -16,6 +16,8 @@ from xkit.serving.cluster import XpoolClusterLaunch, process_diagnostics
 from xkit.serving.readiness import ReadinessEvidence
 from xkit.serving.sglang.endpoints import SglangEndpointFamily, SglangEndpointFamilyLease
 from xkit.serving.sglang.launch import SglangLaunchModel
+from xkit.task import get_task_root
+from xpool.integrations.sglang.devkit.requests import SglangRequestLimits
 from xpool.utils.mps import MPS_CLEANUP_TIMEOUT_S
 
 HTTP_TIMEOUT_SECONDS = 30.0
@@ -98,6 +100,16 @@ class SglangServerProcess:
 
         return process_diagnostics([self.owner])
 
+    async def request_limits(self, *, context_length: int, deadline: float) -> SglangRequestLimits:
+        """Read static startup limits within the enclosing startup budget."""
+        timeout = min(HTTP_TIMEOUT_SECONDS, deadline - monotonic())
+        if timeout <= 0:
+            raise TimeoutError("serving request-limit query exceeded the startup deadline")
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            response = await client.get(f"{self.url()}/server_info")
+            response.raise_for_status()
+        return SglangRequestLimits.from_server_info(response.content, context_length=context_length)
+
     def close(self, *, deadline: float | None = None) -> None:
         """Notify only this serving leader and retain clients until confirmed exit.
 
@@ -116,19 +128,13 @@ class SglangServerProcess:
             last_diagnostic: tuple[type[Exception], str] | None = None
             while True:
                 now = monotonic()
-                if now >= self.cleanup_deadline and not expiry_reported:
-                    logger.error(
-                        "serving cleanup expired; retaining clients; manual resolution required pid=%s",
-                        self.owner.process.pid,
-                    )
-                    expiry_reported = True
                 try:
+                    if wait_for_process_group(self.owner.process, 0.0):
+                        break
                     if not self.shutdown_requested and now < self.cleanup_deadline:
                         if self.owner.process.poll() is None:
                             self.owner.process.send_signal(signal.SIGTERM)
                         self.shutdown_requested = True
-                    if wait_for_process_group(self.owner.process, 0.0):
-                        break
                     last_diagnostic = None
                 except Exception as error:
                     diagnostic = type(error), str(error)
@@ -139,6 +145,15 @@ class SglangServerProcess:
                             error,
                         )
                         last_diagnostic = diagnostic
+                if now >= self.cleanup_deadline and not expiry_reported:
+                    logger.error(
+                        "serving cleanup expired; retaining clients; manual resolution required pid=%s",
+                        self.owner.process.pid,
+                    )
+                    root = get_task_root()
+                    if root is not None:
+                        root.request_retirement(self.cleanup_deadline)
+                    expiry_reported = True
                 sleep(0.1)
             self.owner.close()
             self.closed = True
